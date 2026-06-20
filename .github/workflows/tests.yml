@@ -48,7 +48,7 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node }}
-      - uses: nrwl/nx-set-shas@v3
+      - uses: nrwl/nx-set-shas@v5
       - name: Monorepo install
         uses: ./.github/actions/yarn-nm-install
       - name: Run build:ts
@@ -70,7 +70,7 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node }}
-      - uses: nrwl/nx-set-shas@v3
+      - uses: nrwl/nx-set-shas@v5
       - name: Monorepo install
         uses: ./.github/actions/yarn-nm-install
       - name: Run build:ts
@@ -92,7 +92,7 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node }}
-      - uses: nrwl/nx-set-shas@v3
+      - uses: nrwl/nx-set-shas@v5
       - name: Monorepo install
         uses: ./.github/actions/yarn-nm-install
       - name: Run build:ts for admin-test-utils
