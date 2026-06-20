@@ -1,18 +1,19 @@
-import type { ContentTypeSchema } from '@strapi/strapi';
+import type { Core, UID, Struct } from '@strapi/types';
+import type { Model } from '@strapi/database';
 import { ProviderTransferError } from '../../../../../errors/providers';
 import * as queries from '../../../../queries';
 
 export interface IRestoreOptions {
-  assets?: boolean;
+  assets?: boolean; // delete media library files before transfer
   configuration?: {
-    webhook?: boolean;
-    coreStore?: boolean;
+    webhook?: boolean; // delete webhooks before transfer
+    coreStore?: boolean; // delete core store before transfer
   };
   entities?: {
-    include?: string[];
-    exclude?: string[];
-    filters?: ((contentType: ContentTypeSchema) => boolean)[];
-    params?: { [uid: string]: unknown };
+    include?: string[]; // only delete these stage entities before transfer
+    exclude?: string[]; // exclude these stage entities from deletion
+    filters?: ((contentType: Struct.ContentTypeSchema) => boolean)[]; // custom filters to exclude a content type from deletion
+    params?: { [uid: string]: unknown }; // params object passed to deleteMany before transfer for custom deletions
   };
 }
 
@@ -21,8 +22,8 @@ interface IDeleteResults {
   aggregate: { [uid: string]: { count: number } };
 }
 
-export const deleteRecords = async (strapi: Strapi.Strapi, options?: IRestoreOptions) => {
-  const entities = await deleteEntitiesRecord(strapi, options);
+export const deleteRecords = async (strapi: Core.Strapi, options: IRestoreOptions) => {
+  const entities = await deleteEntitiesRecords(strapi, options);
   const configuration = await deleteConfigurationRecords(strapi, options);
 
   return {
@@ -32,51 +33,86 @@ export const deleteRecords = async (strapi: Strapi.Strapi, options?: IRestoreOpt
   };
 };
 
-const deleteEntitiesRecord = async (
-  strapi: Strapi.Strapi,
+const deleteEntitiesRecords = async (
+  strapi: Core.Strapi,
   options: IRestoreOptions = {}
 ): Promise<IDeleteResults> => {
   const { entities } = options;
-  const query = queries.entity.createEntityQuery(strapi);
-  const contentTypes = Object.values<ContentTypeSchema>(strapi.contentTypes);
 
-  const contentTypesToClear = contentTypes.filter((contentType) => {
-    let keep = true;
+  const models = strapi.get('models').get() as Model[];
+  const contentTypes = Object.values(strapi.contentTypes) as Struct.ContentTypeSchema[];
 
-    if (entities?.include) {
-      keep = entities.include.includes(contentType.uid);
-    }
+  const contentTypesToClear = contentTypes
+    .filter((contentType) => {
+      let removeThisContentType = true;
 
-    if (entities?.exclude) {
-      keep = !entities.exclude.includes(contentType.uid);
-    }
+      // include means "only include these types" so if it's not in here, it's not being included
+      if (entities?.include) {
+        removeThisContentType = entities.include.includes(contentType.uid);
+      }
 
-    if (entities?.filters) {
-      keep = entities.filters.every((filter) => filter(contentType));
-    }
+      // if something is excluded, remove it. But lack of being excluded doesn't mean it's kept
+      if (entities?.exclude && entities.exclude.includes(contentType.uid)) {
+        removeThisContentType = false;
+      }
 
-    return keep;
-  });
+      if (entities?.filters) {
+        removeThisContentType = entities.filters.every((filter) => filter(contentType));
+      }
 
-  const [results, updateResults] = useResults(
-    contentTypesToClear.map((contentType) => contentType.uid)
-  );
+      return removeThisContentType;
+    })
+    .map((contentType) => contentType.uid);
 
-  const deletePromises = contentTypesToClear.map(async (contentType) => {
-    const result = await query(contentType.uid).deleteMany(entities?.params);
+  const modelsToClear = models
+    .filter((model) => {
+      if (contentTypesToClear.includes(model.uid as UID.ContentType)) {
+        return false;
+      }
+
+      let removeThisModel = true;
+
+      // include means "only include these types" so if it's not in here, it's not being included
+      if (entities?.include) {
+        removeThisModel = entities.include.includes(model.uid);
+      }
+
+      // if something is excluded, remove it. But lack of being excluded doesn't mean it's kept
+      if (entities?.exclude && entities.exclude.includes(model.uid)) {
+        removeThisModel = false;
+      }
+
+      return removeThisModel;
+    })
+    .map((model) => model.uid);
+
+  const [results, updateResults] = useResults([...contentTypesToClear, ...modelsToClear]);
+
+  const contentTypeQuery = queries.entity.createEntityQuery(strapi);
+
+  const contentTypePromises = contentTypesToClear.map(async (uid) => {
+    const result = await contentTypeQuery(uid).deleteMany(entities?.params);
 
     if (result) {
-      updateResults(result.count || 0, contentType.uid);
+      updateResults(result.count || 0, uid);
     }
   });
 
-  await Promise.all(deletePromises);
+  const modelsPromises = modelsToClear.map(async (uid) => {
+    const result = await strapi.db.query(uid).deleteMany({});
+
+    if (result) {
+      updateResults(result.count || 0, uid);
+    }
+  });
+
+  await Promise.all([...contentTypePromises, ...modelsPromises]);
 
   return results;
 };
 
 const deleteConfigurationRecords = async (
-  strapi: Strapi.Strapi,
+  strapi: Core.Strapi,
   options: IRestoreOptions = {}
 ): Promise<IDeleteResults> => {
   const { coreStore = true, webhook = true } = options?.configuration ?? {};
@@ -88,7 +124,7 @@ const deleteConfigurationRecords = async (
   }
 
   if (webhook) {
-    models.push('webhook');
+    models.push('strapi::webhook');
   }
 
   const [results, updateResults] = useResults(models);

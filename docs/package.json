@@ -3,27 +3,15 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "docusaurus": "docusaurus",
-    "start": "docusaurus start",
     "build": "docusaurus build",
-    "swizzle": "docusaurus swizzle",
-    "deploy": "docusaurus deploy",
     "clear": "docusaurus clear",
+    "deploy": "docusaurus deploy",
+    "docusaurus": "docusaurus",
     "serve": "docusaurus serve",
-    "write-translations": "docusaurus write-translations",
-    "write-heading-ids": "docusaurus write-heading-ids"
-  },
-  "dependencies": {
-    "@docusaurus/core": "2.2.0",
-    "@docusaurus/preset-classic": "2.2.0",
-    "@mdx-js/react": "^1.6.22",
-    "clsx": "^1.1.1",
-    "prism-react-renderer": "^1.3.3",
-    "react": "^17.0.2",
-    "react-dom": "^17.0.2"
-  },
-  "devDependencies": {
-    "@docusaurus/module-type-aliases": "2.2.0"
+    "start": "TYPEDOC_WATCH=true docusaurus start",
+    "swizzle": "docusaurus swizzle",
+    "write-heading-ids": "docusaurus write-heading-ids",
+    "write-translations": "docusaurus write-translations"
   },
   "browserslist": {
     "production": [
@@ -36,5 +24,38 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
+  },
+  "resolutions": {
+    "@babel/helpers": "7.29.2",
+    "@babel/runtime": "7.29.2",
+    "@babel/runtime-corejs3": "7.29.2",
+    "uuid@^8.3.2": "11.1.1",
+    "qs@~6.14.0": "6.15.2",
+    "serialize-javascript@^6.0.0": "7.0.5",
+    "serialize-javascript@^6.0.1": "7.0.5"
+  },
+  "dependencies": {
+    "@cmfcmf/docusaurus-search-local": "2.0.1",
+    "@docusaurus/core": "3.10.1",
+    "@docusaurus/preset-classic": "3.10.1",
+    "@docusaurus/theme-mermaid": "3.10.1",
+    "@mdx-js/react": "3.1.1",
+    "clsx": "2.1.1",
+    "prism-react-renderer": "2.4.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@docusaurus/babel": "3.10.1",
+    "@docusaurus/module-type-aliases": "3.10.1",
+    "@docusaurus/tsconfig": "3.10.1",
+    "@types/mdast": "4.0.4",
+    "@types/react": "18.3.2",
+    "@types/react-dom": "18.3.0",
+    "docusaurus-plugin-typedoc": "1.4.2",
+    "typedoc": "0.28.19",
+    "typedoc-plugin-markdown": "4.11.0",
+    "typescript": "5.4.5",
+    "unist-util-visit": "5.0.0"
   }
 }

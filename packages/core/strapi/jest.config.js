@@ -2,5 +2,12 @@
 
 module.exports = {
   preset: '../../../jest-preset.unit.js',
-  displayName: 'Core Strapi',
+  transform: {
+    '^.+\\.ts$': ['@swc/jest'],
+  },
+  testMatch: ['<rootDir>/**/*.test.ts'],
+  displayName: 'Strapi',
+  moduleNameMapper: {
+    '^inquirer$': '<rootDir>/src/test/mocks/inquirer.ts',
+  },
 };

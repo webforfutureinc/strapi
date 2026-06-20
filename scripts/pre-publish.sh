@@ -18,5 +18,5 @@ if [[ -z "$distTag" ]]; then
   read -r distTag
 fi
 
-# publish packages
-./node_modules/.bin/lerna publish --no-push --no-git-tag-version --force-publish --exact "$version" --dist-tag "$distTag" $@
+## publish packages
+yarn release --version "$version" --tag "$distTag" --git-commit false --git-tag false --changelog false --dry-run false "$@"

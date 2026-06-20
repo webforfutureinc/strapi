@@ -1,28 +1,24 @@
-import { NodePlopAPI, ActionType } from 'plop';
 import { join } from 'path';
+import type { NodePlopAPI, ActionType } from 'plop';
 import slugify from '@sindresorhus/slugify';
 import fs from 'fs-extra';
-import utils from '@strapi/utils';
+import { strings } from '@strapi/utils';
 import tsUtils from '@strapi/typescript-utils';
 
 import getDestinationPrompts from './prompts/get-destination-prompts';
 import getFilePath from './utils/get-file-path';
 import ctNamesPrompts from './prompts/ct-names-prompts';
 import kindPrompts from './prompts/kind-prompts';
-import draftAndPublishPrompts from './prompts/draft-and-publish-prompts';
 import getAttributesPrompts from './prompts/get-attributes-prompts';
 import bootstrapApiPrompts from './prompts/bootstrap-api-prompts';
+import { appendToFile } from './utils/extend-plugin-index-files';
 
 export default (plop: NodePlopAPI) => {
   // Model generator
   plop.setGenerator('content-type', {
     description: 'Generate a content type for an API',
     async prompts(inquirer) {
-      const config = await inquirer.prompt([
-        ...ctNamesPrompts,
-        ...kindPrompts,
-        ...draftAndPublishPrompts,
-      ]);
+      const config = await inquirer.prompt([...ctNamesPrompts, ...kindPrompts]);
       const attributes = await getAttributesPrompts(inquirer);
 
       const api = await inquirer.prompt([
@@ -34,7 +30,7 @@ export default (plop: NodePlopAPI) => {
           default: config.singularName,
           message: 'Name of the new API?',
           async validate(input) {
-            if (!utils.isKebabCase(input)) {
+            if (!strings.isKebabCase(input)) {
               return 'Value must be in kebab-case';
             }
 
@@ -85,9 +81,19 @@ export default (plop: NodePlopAPI) => {
       }, {});
 
       const filePath = getFilePath(answers.destination);
-      // TODO: use basePath instead
       const currentDir = process.cwd();
-      const language = tsUtils.isUsingTypeScriptSync(currentDir) ? 'ts' : 'js';
+      let language = tsUtils.isUsingTypeScriptSync(currentDir) ? 'ts' : 'js';
+
+      if (answers.plugin) {
+        // The tsconfig in plugins is located just outside the server src, not in the root of the plugin.
+        const pluginServerDir = join(
+          currentDir,
+          'src',
+          filePath.replace('{{ plugin }}', answers.plugin),
+          '../'
+        );
+        language = tsUtils.isUsingTypeScriptSync(pluginServerDir) ? 'ts' : 'js';
+      }
 
       const baseActions: Array<ActionType> = [
         {
@@ -108,6 +114,36 @@ export default (plop: NodePlopAPI) => {
             const parsedTemplate = JSON.parse(template);
             parsedTemplate.attributes = attributes;
             return JSON.stringify(parsedTemplate, null, 2);
+          },
+        });
+      }
+
+      if (answers.plugin) {
+        const indexPath = join(
+          plop.getDestBasePath(),
+          `${filePath}/content-types/index.${language}`
+        );
+        const exists = fs.existsSync(indexPath);
+
+        if (!exists) {
+          // Create index file if it doesn't exist
+          baseActions.push({
+            type: 'add',
+            path: `${filePath}/content-types/index.${language}`,
+            templateFile: `templates/${language}/plugin/plugin.index.${language}.hbs`,
+            skipIfExists: true,
+          });
+        }
+
+        // Append the new content type to the index.ts file
+        baseActions.push({
+          type: 'modify',
+          path: `${filePath}/content-types/index.${language}`,
+          transform(template: string) {
+            return appendToFile(template, {
+              type: 'content-type',
+              singularName: answers.singularName,
+            });
           },
         });
       }
@@ -139,11 +175,84 @@ export default (plop: NodePlopAPI) => {
           },
           {
             type: 'add',
-            path: `${filePath}/routes/{{ singularName }}.${language}`,
+            path: `${filePath}/routes/${answers.plugin ? 'content-api/' : ''}{{ singularName }}.${language}`,
             templateFile: `templates/${language}/core-router.${language}.hbs`,
             data: { uid },
           }
         );
+
+        if (answers.plugin) {
+          const indexFiles = ['controllers', 'services', 'routes'];
+
+          indexFiles.forEach((type) => {
+            const indexPath = join(plop.getDestBasePath(), `${filePath}/${type}/index.${language}`);
+            const exists = fs.existsSync(indexPath);
+
+            if (!exists && type !== 'routes') {
+              baseActions.push({
+                type: 'add',
+                path: `${filePath}/${type}/index.${language}`,
+                templateFile: `templates/${language}/plugin/plugin.index.${language}.hbs`,
+                skipIfExists: true,
+              });
+            }
+
+            if (type === 'routes') {
+              const indexPath = join(
+                plop.getDestBasePath(),
+                `${filePath}/${type}/index.${language}`
+              );
+              const exists = fs.existsSync(indexPath);
+
+              if (!exists) {
+                baseActions.push({
+                  type: 'add',
+                  path: `${filePath}/${type}/index.${language}`,
+                  templateFile: `templates/${language}/plugin/plugin.routes.index.${language}.hbs`,
+                  skipIfExists: true,
+                });
+              }
+
+              const routeIndexFiles = ['content-api', 'admin'];
+
+              routeIndexFiles.forEach((routeType) => {
+                const routeTypeIndexPath = join(
+                  plop.getDestBasePath(),
+                  `${filePath}/${type}/${routeType}/index.${language}`
+                );
+                const routeTypeExists = fs.existsSync(routeTypeIndexPath);
+
+                if (!routeTypeExists) {
+                  baseActions.push({
+                    type: 'add',
+                    path: `${filePath}/${type}/${routeType}/index.${language}`,
+                    templateFile: `templates/${language}/plugin/plugin.routes.type.index.${language}.hbs`,
+                    data: { type: routeType },
+                    skipIfExists: true,
+                  });
+                }
+              });
+            }
+
+            baseActions.push({
+              type: 'modify',
+              path: `${filePath}/${type}/${type === 'routes' ? 'content-api/' : ''}index.${language}`,
+              transform(template: string) {
+                if (type === 'routes') {
+                  return appendToFile(template, {
+                    type: 'routes',
+                    singularName: answers.singularName,
+                  });
+                }
+
+                return appendToFile(template, {
+                  type: 'index',
+                  singularName: answers.singularName,
+                });
+              },
+            });
+          });
+        }
       }
 
       return baseActions;

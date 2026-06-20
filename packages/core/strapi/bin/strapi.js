@@ -1,7 +1,4 @@
 #!/usr/bin/env node
+const { runCLI } = require('../dist/cli');
 
-'use strict';
-
-const { runStrapiCommand } = require('../lib/commands');
-
-runStrapiCommand(process.argv);
+runCLI(process.argv);

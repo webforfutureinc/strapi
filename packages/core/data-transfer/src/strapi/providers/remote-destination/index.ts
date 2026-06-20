@@ -1,28 +1,63 @@
-import { WebSocket } from 'ws';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { Writable } from 'stream';
+import { WebSocket } from 'ws';
 import { once } from 'lodash/fp';
+import type { Struct, Utils } from '@strapi/types';
 
 import { createDispatcher, connectToWebsocket, trimTrailingSlash } from '../utils';
 
-import type { IDestinationProvider, IMetadata, ProviderType, IAsset } from '../../../../types';
-import type { client, server } from '../../../../types/remote/protocol';
+import type {
+  IDestinationProvider,
+  IMetadata,
+  ProviderType,
+  IAsset,
+  TransferStage,
+  Protocol,
+} from '../../../types';
+import type { IDiagnosticReporter } from '../../../utils/diagnostic';
+import type { Client, Server, Auth } from '../../../types/remote/protocol';
 import type { ILocalStrapiDestinationProviderOptions } from '../local-destination';
 import { TRANSFER_PATH } from '../../remote/constants';
 import { ProviderTransferError, ProviderValidationError } from '../../../errors/providers';
-
-interface ITransferTokenAuth {
-  type: 'token';
-  token: string;
-}
+import {
+  createTransferAssetStreamChunk,
+  createTransferAssetStreamChunkLegacy,
+  transferAssetStreamChunkByteLength,
+} from '../../../utils/transfer-asset-chunk';
 
 export interface IRemoteStrapiDestinationProviderOptions
-  extends Pick<ILocalStrapiDestinationProviderOptions, 'restore' | 'strategy'> {
-  url: URL;
-  auth?: ITransferTokenAuth;
+  extends Pick<ILocalStrapiDestinationProviderOptions, 'restore' | 'strategy' | 'onTransferPhase'> {
+  url: URL; // the url of the remote Strapi admin
+  auth?: Auth.ITransferTokenAuth;
+  retryMessageOptions?: {
+    retryMessageTimeout: number; // milliseconds to wait for a response from a message
+    retryMessageMaxRetries: number; // max number of retries for a message before aborting transfer
+  };
+  /** Include per-asset stream checksums and require peers to validate on receive. */
+  verifyChecksums?: boolean;
 }
 
 const jsonLength = (obj: object) => Buffer.byteLength(JSON.stringify(obj));
+
+/**
+ * Default batching for entities / links / configuration over WebSocket push.
+ *
+ * Goals: (1) enough payload per round-trip to stay efficient on large transfers,
+ * (2) small enough per message that the remote can process and ack without multi-minute stalls,
+ * (3) bounded gap between engine progress and the wire (see item cap + age).
+ *
+ * These are fixed defaults (not tuned per dataset) so behavior is predictable everywhere.
+ */
+const STREAM_STEP_MAX_BATCH_BYTES = 512 * 1024;
+
+/** Caps parallel work per message and how far UI count can lead the network for tiny rows. */
+const STREAM_STEP_MAX_BATCH_ITEMS = 100;
+
+/**
+ * If the first row in the current batch has waited this long, flush before appending more.
+ * Helps mixed-size streams (e.g. occasional large rows) without relying on tiny byte caps alone.
+ */
+const STREAM_STEP_MAX_BATCH_AGE_MS = 450;
 
 class RemoteStrapiDestinationProvider implements IDestinationProvider {
   name = 'destination::remote-strapi';
@@ -37,33 +72,93 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
 
   transferID: string | null;
 
+  stats!: { [TStage in Exclude<TransferStage, 'schemas'>]: { count: number } };
+
+  #diagnostics?: IDiagnosticReporter;
+
+  #checksumsEnabled = false;
+
+  /**
+   * Wire format for asset chunks. `'base64'` is the compact default introduced in #23479; remotes
+   * that predate that PR do `Buffer.from(item.data.data)` directly and need the legacy
+   * `{ type: 'Buffer', data: number[] }` shape instead. Set by init negotiation.
+   */
+  #assetEncoding: 'base64' | 'legacy-buffer-json' = 'base64';
+
   constructor(options: IRemoteStrapiDestinationProviderOptions) {
     this.options = options;
     this.ws = null;
     this.dispatcher = null;
     this.transferID = null;
+    this.#checksumsEnabled = options.verifyChecksums === true;
+
+    this.resetStats();
+  }
+
+  private resetStats() {
+    this.stats = {
+      assets: { count: 0 },
+      entities: { count: 0 },
+      links: { count: 0 },
+      configuration: { count: 0 },
+    };
   }
 
   async initTransfer(): Promise<string> {
     const { strategy, restore } = this.options;
+    const wantsChecksums = this.options.verifyChecksums === true;
 
     const query = this.dispatcher?.dispatchCommand({
       command: 'init',
-      params: { options: { strategy, restore }, transfer: 'push' },
+      params: {
+        options: { strategy, restore },
+        transfer: 'push',
+        ...(wantsChecksums ? { checksums: true } : {}),
+        assetEncoding: 'base64',
+      },
     });
 
-    const res = (await query) as server.Payload<server.InitMessage>;
+    const res = (await query) as
+      | (Server.Payload<Server.InitMessage> & {
+          checksums?: boolean;
+          assetEncoding?: 'base64';
+        })
+      | null;
     if (!res?.transferID) {
       throw new ProviderTransferError('Init failed, invalid response from the server');
     }
+    this.#checksumsEnabled = wantsChecksums && res.checksums === true;
+    if (wantsChecksums && res.checksums !== true) {
+      this.#reportWarning(
+        '[Data transfer][push] Checksums were requested but the remote does not support checksum negotiation; continuing without checksum validation.'
+      );
+    }
+
+    // A remote that predates #23479 silently drops the `assetEncoding` field instead of echoing
+    // it. Falling back to the legacy Buffer JSON shape keeps small pushes working against those
+    // remotes; large pushes may still OOM the remote during `JSON.parse` because that shape
+    // allocates the full byte array — emit a warning so the user understands the trade-off.
+    if (res.assetEncoding === 'base64') {
+      this.#assetEncoding = 'base64';
+    } else {
+      this.#assetEncoding = 'legacy-buffer-json';
+      this.#reportWarning(
+        '[Data transfer][push] Remote does not support the compact base64 asset-chunk format; ' +
+          'falling back to legacy Buffer JSON. Large files may cause out-of-memory errors on the remote — ' +
+          'upgrade the remote Strapi to pick up PR #23479 to use the memory-bounded wire format.'
+      );
+    }
+
+    this.resetStats();
+
     return res.transferID;
   }
 
-  #startStepOnce(stage: client.TransferPushStep) {
+  #startStepOnce(stage: Client.TransferPushStep) {
     return once(() => this.#startStep(stage));
   }
 
-  async #startStep<T extends client.TransferPushStep>(step: T) {
+  async #startStep<T extends Client.TransferPushStep>(step: T) {
     try {
       await this.dispatcher?.dispatchTransferStep({ action: 'start', step });
     } catch (e) {
@@ -78,33 +173,48 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
       return new ProviderTransferError('Unexpected error');
     }
 
+    this.stats[step] = { count: 0 };
+
     return null;
   }
 
-  async #endStep<T extends client.TransferPushStep>(step: T) {
+  async #endStep<T extends Client.TransferPushStep>(step: T) {
     try {
-      await this.dispatcher?.dispatchTransferStep({ action: 'end', step });
+      const res = await this.dispatcher?.dispatchTransferStep<{
+        ok: boolean;
+        stats: Protocol.Client.Stats;
+      }>({
+        action: 'end',
+        step,
+      });
+
+      return { stats: res?.stats ?? null, error: null };
     } catch (e) {
       if (e instanceof Error) {
-        return e;
+        return { stats: null, error: e };
       }
 
       if (typeof e === 'string') {
-        return new ProviderTransferError(e);
+        return { stats: null, error: new ProviderTransferError(e) };
       }
 
-      return new ProviderTransferError('Unexpected error');
+      return { stats: null, error: new ProviderTransferError('Unexpected error') };
     }
-
-    return null;
   }
 
-  async #streamStep<T extends client.TransferPushStep>(
+  async #streamStep<T extends Client.TransferPushStep>(
     step: T,
-    data: client.GetTransferPushStreamData<T>
+    message: Client.GetTransferPushStreamData<T>
   ) {
     try {
-      await this.dispatcher?.dispatchTransferStep({ action: 'stream', step, data });
+      if (step === 'assets') {
+        const assetMessage = message as Protocol.Client.TransferAssetFlow[];
+        this.stats[step].count += assetMessage.filter((data) => data.action === 'start').length;
+      } else {
+        this.stats[step].count += message.length;
+      }
+
+      await this.dispatcher?.dispatchTransferStep({ action: 'stream', step, data: message });
     } catch (e) {
       if (e instanceof Error) {
         return e;
@@ -120,47 +230,84 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
     return null;
   }
 
-  #writeStream(step: Exclude<client.TransferPushStep, 'assets'>): Writable {
+  #writeStream(step: Exclude<Client.TransferPushStep, 'assets'>): Writable {
     type Step = typeof step;
 
-    const batchSize = 1024 * 1024; // 1MB;
     const startTransferOnce = this.#startStepOnce(step);
 
-    let batch = [] as client.GetTransferPushStreamData<Step>;
+    let batch = [] as Client.GetTransferPushStreamData<Step>;
+    let batchStartedAt = 0;
 
     const batchLength = () => jsonLength(batch);
+
+    const flushBatch = async (): Promise<Error | null> => {
+      if (batch.length === 0) {
+        return null;
+      }
+      const payload = batch;
+      batch = [];
+      batchStartedAt = 0;
+      return this.#streamStep(step, payload);
+    };
+
+    const shouldFlushBatchAfterPush = () => {
+      if (batch.length === 0) {
+        return false;
+      }
+      return (
+        batchLength() >= STREAM_STEP_MAX_BATCH_BYTES ||
+        batch.length >= STREAM_STEP_MAX_BATCH_ITEMS ||
+        Date.now() - batchStartedAt >= STREAM_STEP_MAX_BATCH_AGE_MS
+      );
+    };
 
     return new Writable({
       objectMode: true,
 
       final: async (callback) => {
         if (batch.length > 0) {
-          const streamError = await this.#streamStep(step, batch);
-
-          batch = [];
+          const streamError = await flushBatch();
 
           if (streamError) {
             return callback(streamError);
           }
         }
-        const e = await this.#endStep(step);
+        const { error, stats } = await this.#endStep(step);
 
-        callback(e);
+        const { count } = this.stats[step];
+
+        if (stats && (stats.started !== count || stats.finished !== count)) {
+          callback(
+            new Error(
+              `Data missing: sent ${this.stats[step].count} ${step}, received ${stats.started} and saved ${stats.finished} ${step}`
+            )
+          );
+        }
+
+        callback(error);
       },
 
-      write: async (chunk, _encoding, callback) => {
+      async write(chunk, _encoding, callback) {
         const startError = await startTransferOnce();
         if (startError) {
           return callback(startError);
         }
 
+        // Flush a batch that has sat long enough before growing it further (bounded latency).
+        if (batch.length > 0 && Date.now() - batchStartedAt >= STREAM_STEP_MAX_BATCH_AGE_MS) {
+          const staleError = await flushBatch();
+          if (staleError) {
+            return callback(staleError);
+          }
+        }
+
         batch.push(chunk);
+        if (batch.length === 1) {
+          batchStartedAt = Date.now();
+        }
 
-        if (batchLength() >= batchSize) {
-          const streamError = await this.#streamStep(step, batch);
-
-          batch = [];
-
+        if (shouldFlushBatchAfterPush()) {
+          const streamError = await flushBatch();
           if (streamError) {
             return callback(streamError);
           }
@@ -171,7 +318,30 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
     });
   }
 
-  async bootstrap(): Promise<void> {
+  #reportInfo(message: string) {
+    this.#diagnostics?.report({
+      details: {
+        createdAt: new Date(),
+        message,
+        origin: 'remote-destination-provider',
+      },
+      kind: 'info',
+    });
+  }
+
+  #reportWarning(message: string) {
+    this.#diagnostics?.report({
+      details: {
+        createdAt: new Date(),
+        message,
+        origin: 'remote-destination-provider',
+      },
+      kind: 'warning',
+    });
+  }
+
+  async bootstrap(diagnostics?: IDiagnosticReporter): Promise<void> {
+    this.#diagnostics = diagnostics;
     const { url, auth } = this.options;
     const validProtocols = ['https:', 'http:'];
 
@@ -191,15 +361,16 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
       url.pathname
     )}${TRANSFER_PATH}/push`;
 
+    this.#reportInfo('establishing websocket connection');
     // No auth defined, trying public access for transfer
     if (!auth) {
-      ws = await connectToWebsocket(wsUrl);
+      ws = await connectToWebsocket(wsUrl, undefined, this.#diagnostics);
     }
 
     // Common token auth, this should be the main auth method
     else if (auth.type === 'token') {
       const headers = { Authorization: `Bearer ${auth.token}` };
-      ws = await connectToWebsocket(wsUrl, { headers });
+      ws = await connectToWebsocket(wsUrl, { headers }, this.#diagnostics);
     }
 
     // Invalid auth method provided
@@ -212,10 +383,20 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
       });
     }
 
-    this.ws = ws;
-    this.dispatcher = createDispatcher(this.ws);
+    this.#reportInfo('established websocket connection');
 
+    this.ws = ws;
+    const { retryMessageOptions } = this.options;
+
+    this.#reportInfo('creating dispatcher');
+    this.dispatcher = createDispatcher(this.ws, retryMessageOptions, (message: string) =>
+      this.#reportInfo(message)
+    );
+    this.#reportInfo('created dispatcher');
+
+    this.#reportInfo('initialize transfer');
     this.transferID = await this.initTransfer();
+    this.#reportInfo(`initialized transfer ${this.transferID}`);
 
     this.dispatcher.setTransferProperties({ id: this.transferID, kind: 'push' });
 
@@ -250,6 +431,9 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
   }
 
   async beforeTransfer() {
+    this.options.onTransferPhase?.(
+      'Remote: waiting for server to clear data and prepare destination…'
+    );
     await this.dispatcher?.dispatchTransferAction('beforeTransfer');
   }
 
@@ -257,12 +441,12 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
     await this.dispatcher?.dispatchTransferAction('rollback');
   }
 
-  getSchemas(): Promise<Strapi.Schemas | null> {
+  getSchemas() {
     if (!this.dispatcher) {
       return Promise.resolve(null);
     }
 
-    return this.dispatcher.dispatchTransferAction<Strapi.Schemas>('getSchemas');
+    return this.dispatcher.dispatchTransferAction<Utils.String.Dict<Struct.Schema>>('getSchemas');
   }
 
   createEntitiesWriteStream(): Writable {
@@ -278,15 +462,17 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
   }
 
   createAssetsWriteStream(): Writable | Promise<Writable> {
-    let batch: client.TransferAssetFlow[] = [];
+    let batch: Client.TransferAssetFlow[] = [];
     let hasStarted = false;
+    const verifyChecksums = this.#checksumsEnabled;
+    const encodeAssetChunk =
+      this.#assetEncoding === 'base64'
+        ? createTransferAssetStreamChunk
+        : createTransferAssetStreamChunkLegacy;
 
     const batchSize = 1024 * 1024; // 1MB;
     const batchLength = () => {
-      return batch.reduce(
-        (acc, chunk) => (chunk.action === 'stream' ? acc + chunk.data.byteLength : acc),
-        0
-      );
+      return batch.reduce((acc, chunk) => acc + transferAssetStreamChunkByteLength(chunk), 0);
     };
     const startAssetsTransferOnce = this.#startStepOnce('assets');
 
@@ -296,7 +482,7 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
       return streamError;
     };
 
-    const safePush = async (chunk: client.TransferAssetFlow) => {
+    const safePush = async (chunk: Client.TransferAssetFlow) => {
       batch.push(chunk);
 
       if (batchLength() >= batchSize) {
@@ -315,9 +501,7 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
         }
 
         if (hasStarted) {
-          await this.#streamStep('assets', null);
-
-          const endStepError = await this.#endStep('assets');
+          const { error: endStepError } = await this.#endStep('assets');
 
           if (endStepError) {
             return callback(endStepError);
@@ -329,7 +513,6 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
 
       async write(asset: IAsset, _encoding, callback) {
         const startError = await startAssetsTransferOnce();
-
         if (startError) {
           return callback(startError);
         }
@@ -337,26 +520,32 @@ class RemoteStrapiDestinationProvider implements IDestinationProvider {
         hasStarted = true;
 
         const assetID = randomUUID();
-        const { filename, filepath, stats, stream } = asset;
+        const { filename, filepath, stats, stream, metadata } = asset;
+        const checksumHash = verifyChecksums ? createHash('sha256') : undefined;
 
         try {
           await safePush({
             action: 'start',
             assetID,
-            data: { filename, filepath, stats },
+            data: { filename, filepath, stats, metadata },
           });
 
           for await (const chunk of stream) {
-            await safePush({ action: 'stream', assetID, data: chunk });
+            checksumHash?.update(chunk);
+            await safePush(encodeAssetChunk(assetID, chunk));
           }
 
-          await safePush({ action: 'end', assetID });
+          await safePush({
+            action: 'end',
+            assetID,
+            ...(checksumHash
+              ? { checksum: { algorithm: 'sha256' as const, value: checksumHash.digest('hex') } }
+              : {}),
+          });
 
           callback();
         } catch (error) {
-          if (error instanceof Error) {
-            callback(error);
-          }
+          callback(error instanceof Error ? error : new Error(String(error)));
         }
       },
     });

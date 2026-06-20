@@ -1,5 +1,83 @@
-import { Readable } from 'stream';
-import type { ITransferEngine, ISourceProvider, IDestinationProvider } from '../../types';
+import { Readable, Writable } from 'stream';
+import { pipeline } from 'stream/promises';
+import type { Core } from '@strapi/types';
+import type { ITransferEngine, ISourceProvider, IDestinationProvider } from '../types';
+
+/**
+ * Create a slow Writable that applies backpressure (low highWaterMark, delayed write).
+ * Used to verify that source streams pause when the consumer is slow.
+ */
+export const createSlowWritable = <T = unknown>(
+  options: {
+    objectMode?: boolean;
+    highWaterMark?: number;
+    delayMs?: number;
+    onChunk?: (chunk: T) => void;
+  } = {}
+): { writable: Writable; chunks: T[] } => {
+  const { objectMode = true, highWaterMark = 1, delayMs = 10, onChunk } = options;
+  const chunks: T[] = [];
+  const writable = new Writable({
+    objectMode,
+    highWaterMark,
+    write(chunk: T, _encoding, callback) {
+      chunks.push(chunk);
+      onChunk?.(chunk);
+      setTimeout(callback, delayMs);
+    },
+  });
+  return { writable, chunks };
+};
+
+/**
+ * Run a backpressure test on a Readable: pipe to a slow consumer and assert the source stream
+ * was paused at least once (proving backpressure is applied). Returns collected chunks for integrity checks.
+ */
+export const assertReadStreamBackpressure = async <T = unknown>(
+  stream: Readable,
+  options: { delayMs?: number; minChunksForBackpressure?: number } = {}
+): Promise<{ sourcePaused: boolean; chunks: T[] }> => {
+  const { delayMs = 10, minChunksForBackpressure } = options;
+  let sourcePaused = false;
+  const originalPause = stream.pause.bind(stream);
+  stream.pause = function pauseWithBackpressureTracking(this: Readable) {
+    sourcePaused = true;
+    return originalPause();
+  };
+
+  const { writable, chunks } = createSlowWritable<T>({ delayMs, highWaterMark: 1 });
+  await pipeline(stream, writable);
+
+  if (minChunksForBackpressure !== undefined && chunks.length < minChunksForBackpressure) {
+    throw new Error(
+      `assertReadStreamBackpressure: need at least ${minChunksForBackpressure} chunk(s) to meaningfully test backpressure, got ${chunks.length}`
+    );
+  }
+
+  return {
+    sourcePaused,
+    chunks,
+  };
+};
+
+/**
+ * Run a backpressure test on a Writable: pipe a fast Readable (many chunks) into it and assert
+ * the readable was paused (proving the destination applies backpressure).
+ */
+export const assertWriteStreamBackpressure = async <T = unknown>(
+  writable: Writable,
+  chunks: T[]
+): Promise<{ sourcePaused: boolean }> => {
+  const source = Readable.from(chunks, { objectMode: true });
+  let sourcePaused = false;
+  const originalPause = source.pause.bind(source);
+  source.pause = function pauseWithBackpressureTracking(this: Readable) {
+    sourcePaused = true;
+    return originalPause();
+  };
+  await pipeline(source, writable);
+  return { sourcePaused };
+};
 
 /**
  * Collect every entity in a Readable stream
@@ -24,13 +102,13 @@ export const collect = <T = unknown>(stream: Readable): Promise<T[]> => {
 export const getStrapiFactory =
   <
     T extends {
-      [key in keyof Partial<Strapi.Strapi>]: unknown;
-    }
+      [key in keyof Partial<Core.Strapi>]: unknown;
+    },
   >(
     properties?: T
   ) =>
-  (additionalProperties?: T) => {
-    return { ...properties, ...additionalProperties } as Strapi.Strapi;
+  (additionalProperties?: Partial<T>) => {
+    return { ...properties, ...additionalProperties } as Core.Strapi;
   };
 
 /**
@@ -47,6 +125,13 @@ export const getContentTypes = (): {
   foo: { uid: 'foo', attributes: { title: { type: 'string' } } },
   bar: { uid: 'bar', attributes: { age: { type: 'number' } } },
 });
+
+/**
+ * Factory to get default strapi models test values
+ */
+export const getStrapiModels = () => {
+  return [{ uid: 'model::foo' }, { uid: 'model::bar' }];
+};
 
 /**
  * Create a factory of readable streams (wrapped with a jest mock function)
@@ -105,7 +190,7 @@ export const destinationStages = [
 /**
  * Update the global store with the given strapi value
  */
-export const setGlobalStrapi = (strapi: Strapi.Strapi): void => {
+export const setGlobalStrapi = (strapi: Core.Strapi): void => {
   (global as unknown as Global).strapi = strapi;
 };
 
@@ -144,7 +229,28 @@ export const extendExpectForDataTransferTests = () => {
         message: () => 'Expected engine not to be valid',
       };
     },
-    toHaveSourceStagesCalledTimes(provider: ISourceProvider, times: number) {
+    toHaveSourceStagesCalledTimes(
+      provider: ISourceProvider,
+      stages: (keyof ISourceProvider)[],
+      times: number
+    ) {
+      try {
+        stages.forEach((stage) => {
+          expect(provider[stage as string].mock.results.length).toEqual(times);
+        });
+        return {
+          pass: true,
+          message: () => 'Expected source provider not to have all stages called',
+        };
+      } catch (e) {
+        return {
+          pass: false,
+          message: () =>
+            `Expected destination sources to have stages ${stages} called ${times} times`,
+        };
+      }
+    },
+    toHaveAllSourceStagesCalledTimes(provider: ISourceProvider, times: number) {
       const missing = sourceStages.filter((stage) => {
         if (provider[stage]) {
           try {
@@ -171,7 +277,28 @@ export const extendExpectForDataTransferTests = () => {
         message: () => 'Expected source provider not to have all stages called',
       };
     },
-    toHaveDestinationStagesCalledTimes(provider: IDestinationProvider, times: number) {
+    toHaveDestinationStagesCalledTimes(
+      provider: IDestinationProvider,
+      stages: (keyof IDestinationProvider)[],
+      times = 1
+    ) {
+      try {
+        stages.forEach((stage) => {
+          expect(provider[stage as string].mock.results.length).toEqual(times);
+        });
+        return {
+          pass: true,
+          message: () => 'Expected destination provider not to have all stages called',
+        };
+      } catch (e) {
+        return {
+          pass: false,
+          message: () =>
+            `Expected destination provider to have stages ${stages} called ${times} times`,
+        };
+      }
+    },
+    toHaveAllDestinationStagesCalledTimes(provider: IDestinationProvider, times: number) {
       const missing = destinationStages.filter((stage) => {
         if (provider[stage]) {
           try {

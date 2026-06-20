@@ -1,15 +1,16 @@
-import type { ContentTypeSchema } from '@strapi/strapi';
-
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore
-import * as componentsService from '@strapi/strapi/lib/services/entity-service/components';
 import { assign, isArray, isEmpty, isObject, map, omit, size } from 'lodash/fp';
 
-const sanitizeComponentLikeAttributes = <T extends object>(model: ContentTypeSchema, data: T) => {
+import type { Core, UID, Data, Struct } from '@strapi/types';
+import * as componentsService from '../../utils/components';
+
+const sanitizeComponentLikeAttributes = <T extends Struct.Schema>(
+  model: T,
+  data: Data.Entity<T['uid']>
+) => {
   const { attributes } = model;
 
   const componentLikeAttributesKey = Object.entries(attributes)
-    .filter(([, attribute]) => ['component', 'dynamiczone'].includes(attribute.type))
+    .filter(([, attribute]) => attribute.type === 'component' || attribute.type === 'dynamiczone')
     .map(([key]) => key);
 
   return omit(componentLikeAttributesKey, data);
@@ -17,9 +18,9 @@ const sanitizeComponentLikeAttributes = <T extends object>(model: ContentTypeSch
 
 const omitInvalidCreationAttributes = omit(['id']);
 
-const createEntityQuery = (strapi: Strapi.Strapi) => {
+const createEntityQuery = (strapi: Core.Strapi): any => {
   const components = {
-    async assignToEntity<T extends object>(uid: string, data: T) {
+    async assignToEntity(uid: UID.Schema, data: any) {
       const model = strapi.getModel(uid);
 
       const entityComponents = await componentsService.createComponents(uid, data);
@@ -29,15 +30,17 @@ const createEntityQuery = (strapi: Strapi.Strapi) => {
     },
 
     async get<T extends object>(uid: string, entity: T) {
-      return componentsService.getComponents(uid, entity);
+      return componentsService.getComponents(uid as UID.Schema, entity as any);
     },
 
     delete<T extends object>(uid: string, componentsToDelete: T) {
-      return componentsService.deleteComponents(uid, componentsToDelete, { loadComponents: false });
+      return componentsService.deleteComponents(uid as UID.Schema, componentsToDelete as any, {
+        loadComponents: false,
+      });
     },
   };
 
-  const query = (uid: string) => {
+  const query = (uid: UID.Schema) => {
     const create = async <T extends { data: U }, U extends object>(params: T) => {
       const dataWithComponents = await components.assignToEntity(uid, params.data);
       const sanitizedData = omitInvalidCreationAttributes(dataWithComponents);
@@ -75,7 +78,7 @@ const createEntityQuery = (strapi: Strapi.Strapi) => {
     };
 
     const getDeepPopulateComponentLikeQuery = (
-      contentType: ContentTypeSchema,
+      contentType: Struct.Schema,
       params = { select: '*' }
     ) => {
       const { attributes } = contentType;

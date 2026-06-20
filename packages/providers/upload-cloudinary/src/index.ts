@@ -1,7 +1,7 @@
 import type { ReadStream } from 'node:fs';
 import { v2 as cloudinary, ConfigOptions, UploadApiOptions } from 'cloudinary';
 import intoStream from 'into-stream';
-import utils from '@strapi/utils';
+import * as utils from '@strapi/utils';
 
 interface File {
   name: string;
@@ -14,6 +14,7 @@ interface File {
   ext?: string;
   mime: string;
   size: number;
+  sizeInBytes: number;
   url: string;
   previewUrl?: string;
   path?: string;
@@ -23,7 +24,7 @@ interface File {
   buffer?: Buffer;
 }
 
-export = {
+export default {
   init(options: ConfigOptions) {
     cloudinary.config(options);
 
@@ -42,41 +43,48 @@ export = {
           config.folder = file.path;
         }
 
-        const uploadStream = cloudinary.uploader.upload_chunked_stream(
-          { ...config, ...customConfig },
-          (err, image) => {
-            if (err) {
-              if (err.message.includes('File size too large')) {
-                reject(new utils.errors.PayloadTooLargeError());
-              } else {
-                reject(new Error(`Error uploading to cloudinary: ${err.message}`));
-              }
-              return;
+        // For files smaller than 99 MB use regular upload as it tends to be faster
+        // and fallback to chunked upload for larger files as that's required by Cloudinary.
+        // https://support.cloudinary.com/hc/en-us/community/posts/360009586100-Upload-movie-video-with-large-size?page=1#community_comment_360002140099
+        // The Cloudinary's max limit for regular upload is actually 100 MB but add some headroom
+        // for size counting shenanigans. (Strapi provides the size in kilobytes rounded to two decimal places here).
+        const uploadMethod =
+          file.size && file.size < 1000 * 99
+            ? cloudinary.uploader.upload_stream
+            : cloudinary.uploader.upload_chunked_stream;
+
+        const uploadStream = uploadMethod({ ...config, ...customConfig }, (err, image) => {
+          if (err) {
+            if (err.message.includes('File size too large')) {
+              reject(new utils.errors.PayloadTooLargeError());
+            } else {
+              reject(new Error(`Error uploading to cloudinary: ${err.message}`));
             }
-
-            if (!image) {
-              return;
-            }
-
-            if (image.resource_type === 'video') {
-              file.previewUrl = cloudinary.url(`${image.public_id}.gif`, {
-                video_sampling: 6,
-                delay: 200,
-                width: 250,
-                crop: 'scale',
-                resource_type: 'video',
-              });
-            }
-
-            file.url = image.secure_url;
-            file.provider_metadata = {
-              public_id: image.public_id,
-              resource_type: image.resource_type,
-            };
-
-            resolve();
+            return;
           }
-        );
+
+          if (!image) {
+            return;
+          }
+
+          if (image.resource_type === 'video') {
+            file.previewUrl = cloudinary.url(`${image.public_id}.gif`, {
+              video_sampling: 6,
+              delay: 200,
+              width: 250,
+              crop: 'scale',
+              resource_type: 'video',
+            });
+          }
+
+          file.url = image.secure_url;
+          file.provider_metadata = {
+            public_id: image.public_id,
+            resource_type: image.resource_type,
+          };
+
+          resolve();
+        });
 
         if (file.stream) {
           file.stream.pipe(uploadStream);
@@ -88,12 +96,52 @@ export = {
       });
     };
 
+    const replace = async (newFile: File, oldFile: File, customConfig = {}): Promise<void> => {
+      const { public_id: oldPublicId, resource_type: oldResourceType } =
+        oldFile.provider_metadata ?? {};
+
+      // If the public_id is preserved, we can overwrite in place and invalidate
+      // the CDN cache in a single call.
+      if (oldPublicId && newFile.hash === oldPublicId) {
+        return upload(newFile, {
+          public_id: oldPublicId as string,
+          overwrite: true,
+          invalidate: true,
+          ...(oldResourceType ? { resource_type: oldResourceType } : {}),
+          ...customConfig,
+        });
+      }
+
+      // The public_id differs — upload the new file first, then destroy the old.
+      await upload(newFile, customConfig);
+
+      if (oldPublicId) {
+        try {
+          await cloudinary.uploader.destroy(`${oldPublicId}`, {
+            resource_type: (oldResourceType || 'image') as string,
+            invalidate: true,
+          });
+        } catch (error) {
+          if (error instanceof Error) {
+            throw new Error(`Error deleting on cloudinary: ${error.message}`);
+          }
+          throw error;
+        }
+      }
+    };
+
     return {
       uploadStream(file: File, customConfig = {}) {
         return upload(file, customConfig);
       },
       upload(file: File, customConfig = {}) {
         return upload(file, customConfig);
+      },
+      replaceStream(newFile: File, oldFile: File, customConfig = {}) {
+        return replace(newFile, oldFile, customConfig);
+      },
+      replace(newFile: File, oldFile: File, customConfig = {}) {
+        return replace(newFile, oldFile, customConfig);
       },
       async delete(file: File, customConfig = {}) {
         try {

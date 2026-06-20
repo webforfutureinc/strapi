@@ -1,14 +1,17 @@
-import type { ContentTypeSchema } from '@strapi/strapi';
+import { Readable, Transform } from 'stream';
+import type { Core, Struct } from '@strapi/types';
 
-import { Readable, PassThrough } from 'stream';
 import * as shared from '../../queries';
-import { IEntity } from '../../../../types';
+import { IEntity } from '../../../types';
 
 /**
  * Generate and consume content-types streams in order to stream each entity individually
  */
-export const createEntitiesStream = (strapi: Strapi.Strapi): Readable => {
-  const contentTypes: ContentTypeSchema[] = Object.values(strapi.contentTypes);
+export const createEntitiesStream = (
+  strapi: Core.Strapi,
+  options: { onWarning?: (message: string) => void } = {}
+): Readable => {
+  const contentTypes: Struct.ContentTypeSchema[] = Object.values(strapi.contentTypes);
 
   async function* contentTypeStreamGenerator() {
     for (const contentType of contentTypes) {
@@ -31,15 +34,22 @@ export const createEntitiesStream = (strapi: Strapi.Strapi): Readable => {
   return Readable.from(
     (async function* entitiesGenerator(): AsyncGenerator<{
       entity: IEntity;
-      contentType: ContentTypeSchema;
+      contentType: Struct.ContentTypeSchema;
     }> {
       for await (const { stream, contentType } of contentTypeStreamGenerator()) {
         try {
           for await (const entity of stream) {
             yield { entity, contentType };
           }
-        } catch {
-          // ignore
+        } catch (error) {
+          // Surface the failure instead of silently dropping the remaining
+          // entities of this content type: every entity skipped here leaves
+          // dangling links pointing at rows that were never transferred
+          const message = error instanceof Error ? error.message : String(error);
+
+          options.onWarning?.(
+            `Failed to read all entities of type "${contentType.uid}" from the source, the remaining entities of this type were skipped: ${message}`
+          );
         } finally {
           stream.destroy();
         }
@@ -52,8 +62,8 @@ export const createEntitiesStream = (strapi: Strapi.Strapi): Readable => {
  * Create an entity transform stream which convert the output of
  * the multi-content-types stream to the transfer entity format
  */
-export const createEntitiesTransformStream = (): PassThrough => {
-  return new PassThrough({
+export const createEntitiesTransformStream = (): Transform => {
+  return new Transform({
     objectMode: true,
     transform(data, _encoding, callback) {
       const { entity, contentType } = data;

@@ -1,4 +1,4 @@
-import type { Schema } from '@strapi/strapi';
+import type { Struct, Utils } from '@strapi/types';
 import { mapValues, pick } from 'lodash/fp';
 
 /**
@@ -19,9 +19,13 @@ const VALID_SCHEMA_PROPERTIES = [
 ];
 
 /**
- * Sanitize a schemas dictionnary by omiting unwanted properties
+ * Sanitize a schemas dictionary by omitting unwanted properties
  * The list of allowed properties can be found here: {@link VALID_SCHEMA_PROPERTIES}
  */
-export const mapSchemasValues = (schemas: Record<string, Schema>) => {
-  return mapValues(pick(VALID_SCHEMA_PROPERTIES), schemas);
+export const mapSchemasValues = (schemas: Utils.String.Dict<Struct.Schema>) => {
+  return mapValues(pick(VALID_SCHEMA_PROPERTIES), schemas) as Utils.String.Dict<Struct.Schema>;
+};
+
+export const schemasToValidJSON = (schemas: Utils.String.Dict<Struct.Schema>) => {
+  return JSON.parse(JSON.stringify(schemas));
 };

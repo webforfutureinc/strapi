@@ -1,10 +1,13 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID, type Hash } from 'crypto';
 import { Writable, PassThrough } from 'stream';
+import type { Core } from '@strapi/types';
 
 import type { TransferFlow, Step } from '../flows';
-import type { TransferStage, IAsset, Protocol } from '../../../../types';
+import type { TransferStage, IAsset, Protocol } from '../../../types';
 
 import { ProviderTransferError } from '../../../errors/providers';
+import { write } from '../../../utils/writable-async-write';
+import { decodeTransferAssetStreamItem } from '../../../utils/transfer-asset-chunk';
 import { createLocalStrapiDestinationProvider } from '../../providers';
 import { createFlow, DEFAULT_TRANSFER_FLOW } from '../flows';
 import { Handler } from './abstract';
@@ -34,15 +37,27 @@ export interface PushHandler extends Handler {
    */
   streams?: { [stage in TransferStage]?: Writable };
 
+  stats: {
+    [stage in Exclude<TransferStage, 'schemas'>]: Protocol.Client.Stats;
+  };
+
   /**
    * Holds all the transferred assets for the current transfer handler (one registry per connection)
    */
-  assets: { [filepath: string]: IAsset & { stream: PassThrough } };
+  assets: { [assetID: string]: IAsset & { stream: PassThrough } };
+  /** Incremental checksum state keyed by transfer asset ID (only populated when checksums are enabled). */
+  assetChecksums?: { [assetID: string]: Hash };
+  checksumsEnabled?: boolean;
 
   /**
-   * Ochestrate and manage the transfer messages' ordering
+   * Orchestrate and manage the transfer messages' ordering
    */
   flow?: TransferFlow;
+
+  /**
+   * Interval for periodic destination memory logging during assets stage
+   */
+  memoryLogInterval?: ReturnType<typeof setInterval>;
 
   /**
    * Checks that the given action is a valid push transfer action
@@ -62,24 +77,24 @@ export interface PushHandler extends Handler {
   /**
    * Callback when receiving a regular transfer message
    */
-  onTransferMessage(msg: Protocol.client.TransferMessage): Promise<unknown> | unknown;
+  onTransferMessage(msg: Protocol.Client.TransferMessage): Promise<unknown> | unknown;
 
   /**
    * Callback when receiving a transfer action message
    */
-  onTransferAction(msg: Protocol.client.Action): Promise<unknown> | unknown;
+  onTransferAction(msg: Protocol.Client.Action): Promise<unknown> | unknown;
 
   /**
    * Callback when receiving a transfer step message
    */
-  onTransferStep(msg: Protocol.client.TransferPushMessage): Promise<unknown> | unknown;
+  onTransferStep(msg: Protocol.Client.TransferPushMessage): Promise<unknown> | unknown;
 
   /**
    * Start streaming an asset
    */
   streamAsset(
     this: PushHandler,
-    payload: Protocol.client.GetTransferPushStreamData<'assets'>
+    payload: Protocol.Client.GetTransferPushStreamData<'assets'>
   ): Promise<void>;
 
   // Transfer Flow
@@ -100,18 +115,6 @@ export interface PushHandler extends Handler {
   assertValidStreamTransferStep(stage: TransferStage): void;
 }
 
-const writeAsync = <T>(stream: Writable, data: T) => {
-  return new Promise<void>((resolve, reject) => {
-    stream.write(data, (error) => {
-      if (error) {
-        reject(error);
-      }
-
-      resolve();
-    });
-  });
-};
-
 export const createPushController = handlerControllerFactory<Partial<PushHandler>>((proto) => ({
   isTransferStarted(this: PushHandler) {
     return proto.isTransferStarted.call(this) && this.provider !== undefined;
@@ -120,18 +123,47 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
   verifyAuth(this: PushHandler) {
     return proto.verifyAuth.call(this, TRANSFER_KIND);
   },
-
+  onInfo(message) {
+    this.diagnostics?.report({
+      details: {
+        message,
+        origin: 'push-handler',
+        createdAt: new Date(),
+      },
+      kind: 'info',
+    });
+  },
+  onWarning(message) {
+    this.diagnostics?.report({
+      details: {
+        message,
+        createdAt: new Date(),
+        origin: 'push-handler',
+      },
+      kind: 'warning',
+    });
+  },
   cleanup(this: PushHandler) {
+    if (this.memoryLogInterval) {
+      clearInterval(this.memoryLogInterval);
+      delete this.memoryLogInterval;
+    }
     proto.cleanup.call(this);
 
     this.streams = {};
     this.assets = {};
+    this.assetChecksums = {};
+    this.checksumsEnabled = false;
 
     delete this.flow;
     delete this.provider;
   },
 
   teardown(this: PushHandler) {
+    if (this.memoryLogInterval) {
+      clearInterval(this.memoryLogInterval);
+      delete this.memoryLogInterval;
+    }
     if (this.provider) {
       this.provider.rollback();
     }
@@ -205,12 +237,20 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
       await this.respond(undefined, new Error('Missing uuid in message'));
     }
 
-    const { uuid, type } = msg;
+    if (proto.hasUUID(msg.uuid)) {
+      const previousResponse = proto.response;
+      if (previousResponse?.uuid === msg.uuid) {
+        await this.respond(previousResponse?.uuid, previousResponse.e, previousResponse.data);
+      }
+      return;
+    }
 
+    const { uuid, type } = msg;
+    proto.addUUID(uuid);
     // Regular command message (init, end, status)
     if (type === 'command') {
       const { command } = msg;
-
+      this.onInfo(`received command:${command} uuid:${uuid}`);
       await this.executeAndRespond(uuid, () => {
         this.assertValidTransferCommand(command);
 
@@ -218,13 +258,13 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
         if (command === 'status') {
           return this.status();
         }
-
         return this[command](msg.params);
       });
     }
 
     // Transfer message (the transfer must be init first)
     else if (type === 'transfer') {
+      this.onInfo(`received transfer action:${msg.action} step:${msg.kind} uuid:${uuid}`);
       await this.executeAndRespond(uuid, async () => {
         await this.verifyAuth();
 
@@ -248,7 +288,7 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
     }
 
     if (kind === 'step') {
-      return this.onTransferStep(msg as Protocol.client.TransferPushMessage);
+      return this.onTransferStep(msg as Protocol.Client.TransferPushMessage);
     }
   },
 
@@ -304,6 +344,23 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
 
       await this.createWritableStreamForStep(stage);
 
+      this.stats[stage] = { started: 0, finished: 0 };
+
+      if (stage === 'assets') {
+        strapi.log.debug(
+          '[Transfer destination] Assets stage started; sampling memory usage every 5s until stage end'
+        );
+        this.memoryLogInterval = setInterval(() => {
+          const mem = process.memoryUsage();
+          const stats = this.stats?.assets;
+          const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
+          const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+          strapi.log.debug(
+            `[Transfer destination] memory RSS=${rssMb}MB heapUsed=${heapMb}MB | assets started=${stats?.started ?? 0} finished=${stats?.finished ?? 0}`
+          );
+        }, 5000);
+      }
+
       return { ok: true };
     }
 
@@ -322,13 +379,21 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
         return this.streamAsset(msg.data);
       }
 
-      // For all other steps
-      await Promise.all(msg.data.map((item) => writeAsync(stream, item)));
+      // One objectMode Writable: do not overlap writes.
+      for (const item of msg.data) {
+        this.stats[stage].started += 1;
+        await write(stream, item);
+        this.stats[stage].finished += 1;
+      }
     }
 
     if (msg.action === 'end') {
+      if (stage === 'assets' && this.memoryLogInterval) {
+        clearInterval(this.memoryLogInterval);
+        delete this.memoryLogInterval;
+        strapi.log.debug('[Transfer destination] Assets stage ended, stopped memory log');
+      }
       this.unlockTransferStep(stage);
-
       const stream = this.streams?.[stage];
 
       if (stream && !stream.closed) {
@@ -339,7 +404,7 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
 
       delete this.streams?.[stage];
 
-      return { ok: true };
+      return { ok: true, stats: this.stats[stage] };
     }
   },
 
@@ -360,14 +425,16 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
 
       this.flow?.set(step);
     }
-
+    if (action === 'bootstrap') {
+      return this.provider?.[action](this.diagnostics);
+    }
     return this.provider?.[action]();
   },
 
   async streamAsset(this: PushHandler, payload) {
     const assetsStream = this.streams?.assets;
 
-    // TODO: close the stream upong receiving an 'end' event instead
+    // TODO: close the stream upon receiving an 'end' event instead
     if (payload === null) {
       this.streams?.assets?.end();
       return;
@@ -381,30 +448,68 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
       }
 
       if (action === 'start') {
+        this.stats.assets.started += 1;
         this.assets[assetID] = { ...item.data, stream: new PassThrough() };
-        writeAsync(assetsStream, this.assets[assetID]);
-      }
+        if (this.checksumsEnabled) {
+          this.assetChecksums ??= {};
+          this.assetChecksums[assetID] = createHash('sha256');
+        }
+        const filename = item.data?.filename ?? assetID;
+        strapi.log.debug(
+          `[Transfer destination] Asset start #${this.stats.assets.started} id=${assetID} filename=${filename}`
+        );
+        // Wait for the assets stage to accept this row (same pattern as remote-source).
+        await write(assetsStream, this.assets[assetID]);
+      } else if (action === 'stream' || action === 'end') {
+        if (!this.assets[assetID]) {
+          throw new ProviderTransferError(
+            `No asset "${assetID}" for ${action} action; send start before stream/end`
+          );
+        }
 
-      if (action === 'stream') {
-        // The buffer has gone through JSON operations and is now of shape { type: "Buffer"; data: UInt8Array }
-        // We need to transform it back into a Buffer instance
-        const rawBuffer = item.data as unknown as { type: 'Buffer'; data: Uint8Array };
-        const chunk = Buffer.from(rawBuffer.data);
-
-        await writeAsync(this.assets[assetID].stream, chunk);
-      }
-
-      if (action === 'end') {
-        await new Promise<void>((resolve, reject) => {
-          const { stream: assetStream } = this.assets[assetID];
-          assetStream
-            .on('close', () => {
-              delete this.assets[assetID];
-              resolve();
-            })
-            .on('error', reject)
-            .end();
-        });
+        if (action === 'stream') {
+          const chunk = decodeTransferAssetStreamItem(item);
+          this.assetChecksums?.[assetID]?.update(chunk);
+          await write(this.assets[assetID].stream, chunk);
+        } else {
+          if (this.checksumsEnabled) {
+            if (!item.checksum) {
+              throw new ProviderTransferError(`Missing checksum for asset "${assetID}"`);
+            }
+            if (item.checksum.algorithm !== 'sha256') {
+              throw new ProviderTransferError(
+                `Unsupported checksum algorithm "${item.checksum.algorithm}" for asset ${assetID}`
+              );
+            }
+            const checksum = this.assetChecksums?.[assetID]?.digest('hex');
+            if (!checksum || checksum !== item.checksum.value) {
+              throw new ProviderTransferError(
+                `Checksum mismatch for asset "${assetID}" (expected ${item.checksum.value}, got ${checksum ?? 'none'})`
+              );
+            }
+          }
+          if (this.assetChecksums?.[assetID]) {
+            delete this.assetChecksums[assetID];
+          }
+          strapi.log.debug(
+            `[Transfer destination] Asset end id=${assetID} (finished=${this.stats.assets.finished + 1}/${this.stats.assets.started})`
+          );
+          await new Promise<void>((resolve, reject) => {
+            const { stream: assetStream } = this.assets[assetID];
+            assetStream
+              .on('close', () => {
+                this.stats.assets.finished += 1;
+                delete this.assets[assetID];
+                resolve();
+              })
+              .on('error', reject)
+              .end();
+          });
+        }
+      } else {
+        throw new ProviderTransferError(
+          `Invalid asset flow action: ${String((item as { action?: unknown }).action)}`
+        );
       }
     }
   },
@@ -422,8 +527,8 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
 
   async init(
     this: PushHandler,
-    params: Protocol.client.GetCommandParams<'init'>
-  ): Promise<Protocol.server.Payload<Protocol.server.InitMessage>> {
+    params: Protocol.Client.GetCommandParams<'init'>
+  ): Promise<Protocol.Server.Payload<Protocol.Server.InitMessage>> {
     if (this.transferID || this.provider) {
       throw new Error('Transfer already in progress');
     }
@@ -434,17 +539,38 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
     this.startedAt = Date.now();
 
     this.assets = {};
+    this.assetChecksums = {};
+    this.checksumsEnabled = params?.checksums === true;
     this.streams = {};
+    this.stats = {
+      assets: { started: 0, finished: 0 },
+      configuration: { started: 0, finished: 0 },
+      entities: { started: 0, finished: 0 },
+      links: { started: 0, finished: 0 },
+    };
 
     this.flow = createFlow(DEFAULT_TRANSFER_FLOW);
 
     this.provider = createLocalStrapiDestinationProvider({
-      ...params.options,
+      strategy: params?.options?.strategy ?? 'restore',
+      restore: params?.options?.restore ?? {},
       autoDestroy: false,
-      getStrapi: () => strapi,
+      getStrapi: () => strapi as Core.Strapi,
     });
 
-    return { transferID: this.transferID };
+    this.provider.onWarning = (message) => {
+      this.onWarning(message);
+      strapi.log.warn(message);
+    };
+
+    return {
+      transferID: this.transferID,
+      checksums: true,
+      // Echo the client's requested asset wire format so it knows we can decode it. Older remotes
+      // (pre-#23479) do `Buffer.from(item.data.data)` directly and will not echo this back — the
+      // client treats the missing field as "base64 unsupported" and falls back to legacy shape.
+      ...(params?.assetEncoding === 'base64' ? { assetEncoding: 'base64' as const } : {}),
+    };
   },
 
   async status(this: PushHandler) {
@@ -466,11 +592,11 @@ export const createPushController = handlerControllerFactory<Partial<PushHandler
 
   async end(
     this: PushHandler,
-    params: Protocol.client.GetCommandParams<'end'>
-  ): Promise<Protocol.server.Payload<Protocol.server.EndMessage>> {
+    params: Protocol.Client.GetCommandParams<'end'>
+  ): Promise<Protocol.Server.Payload<Protocol.Server.EndMessage>> {
     await this.verifyAuth();
 
-    if (this.transferID !== params.transferID) {
+    if (this.transferID !== params?.transferID) {
       throw new ProviderTransferError('Bad transfer ID provided');
     }
 

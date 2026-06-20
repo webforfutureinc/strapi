@@ -10,8 +10,16 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const urlJoin = require('url-join');
 
-const { getAbsoluteAdminUrl, getAbsoluteServerUrl, sanitize } = require('@strapi/utils');
+const { sanitize } = require('@strapi/utils');
+const { toNumber, getOr } = require('lodash/fp');
 const { getService } = require('../utils');
+
+const USER_MODEL_UID = 'plugin::users-permissions.user';
+
+const getSessionManager = () => {
+  const manager = strapi.sessionManager;
+  return manager ?? null;
+};
 
 module.exports = ({ strapi }) => ({
   /**
@@ -21,21 +29,41 @@ module.exports = ({ strapi }) => ({
    */
 
   count(params) {
-    return strapi.query('plugin::users-permissions.user').count({ where: params });
+    return strapi.db.query(USER_MODEL_UID).count({ where: params });
   },
 
   /**
-   * Promise to search count users
+   * Hashes password fields in the provided values object if they are present.
+   * It checks each key in the values object against the model's attributes and
+   * hashes it if the attribute type is 'password',
    *
-   * @return {Promise}
+   * @param {object} values - The object containing the fields to be hashed.
+   * @return {object} The values object with hashed password fields if they were present.
    */
+  async ensureHashedPasswords(values) {
+    const attributes = strapi.getModel(USER_MODEL_UID).attributes;
+
+    for (const key in values) {
+      if (attributes[key] && attributes[key].type === 'password') {
+        // Check if a custom encryption.rounds has been set on the password attribute
+        const rounds = toNumber(getOr(10, 'encryption.rounds', attributes[key]));
+        values[key] = await bcrypt.hash(values[key], rounds);
+      }
+    }
+
+    return values;
+  },
 
   /**
    * Promise to add a/an user.
    * @return {Promise}
    */
   async add(values) {
-    return strapi.entityService.create('plugin::users-permissions.user', {
+    // Use the Document Service so relation inputs accept both the internal
+    // numeric id (legacy) and the documentId (v5 default) syntax, consistent
+    // with every other content-type endpoint. The Document Service hashes
+    // `password` attributes itself, so we must not pre-hash here.
+    return strapi.documents(USER_MODEL_UID).create({
       data: values,
       populate: ['role'],
     });
@@ -48,7 +76,21 @@ module.exports = ({ strapi }) => ({
    * @return {Promise}
    */
   async edit(userId, params = {}) {
-    return strapi.entityService.update('plugin::users-permissions.user', userId, {
+    // The user is addressed by its numeric id (e.g. the `/users/:id` route),
+    // but the Document Service updates by documentId. Resolve it first so the
+    // relation inputs are processed by the Document Service, which accepts both
+    // numeric ids (legacy) and documentIds (v5 default). The Document Service
+    // hashes `password` attributes itself, so we must not pre-hash here.
+    const entry = await strapi.db
+      .query(USER_MODEL_UID)
+      .findOne({ where: { id: userId }, select: ['documentId'] });
+
+    if (!entry) {
+      return null;
+    }
+
+    return strapi.documents(USER_MODEL_UID).update({
+      documentId: entry.documentId,
       data: params,
       populate: ['role'],
     });
@@ -59,7 +101,14 @@ module.exports = ({ strapi }) => ({
    * @return {Promise}
    */
   fetch(id, params) {
-    return strapi.entityService.findOne('plugin::users-permissions.user', id, params);
+    const query = strapi.get('query-params').transform(USER_MODEL_UID, params ?? {});
+
+    return strapi.db.query(USER_MODEL_UID).findOne({
+      ...query,
+      where: {
+        $and: [{ id }, query.where || {}],
+      },
+    });
   },
 
   /**
@@ -67,9 +116,7 @@ module.exports = ({ strapi }) => ({
    * @return {Promise}
    */
   fetchAuthenticatedUser(id) {
-    return strapi
-      .query('plugin::users-permissions.user')
-      .findOne({ where: { id }, populate: ['role'] });
+    return strapi.db.query(USER_MODEL_UID).findOne({ where: { id }, populate: ['role'] });
   },
 
   /**
@@ -77,7 +124,9 @@ module.exports = ({ strapi }) => ({
    * @return {Promise}
    */
   fetchAll(params) {
-    return strapi.entityService.findMany('plugin::users-permissions.user', params);
+    const query = strapi.get('query-params').transform(USER_MODEL_UID, params ?? {});
+
+    return strapi.db.query(USER_MODEL_UID).findMany(query);
   },
 
   /**
@@ -85,7 +134,13 @@ module.exports = ({ strapi }) => ({
    * @return {Promise}
    */
   async remove(params) {
-    return strapi.query('plugin::users-permissions.user').delete({ where: params });
+    // Invalidate sessions for all affected users
+    const sessionManager = getSessionManager();
+    if (sessionManager && sessionManager.hasOrigin('users-permissions') && params.id) {
+      await sessionManager('users-permissions').invalidateRefreshToken(String(params.id));
+    }
+
+    return strapi.db.query(USER_MODEL_UID).delete({ where: params });
   },
 
   validatePassword(password, hash) {
@@ -95,14 +150,20 @@ module.exports = ({ strapi }) => ({
   async sendConfirmationEmail(user) {
     const userPermissionService = getService('users-permissions');
     const pluginStore = await strapi.store({ type: 'plugin', name: 'users-permissions' });
-    const userSchema = strapi.getModel('plugin::users-permissions.user');
+    const userSchema = strapi.getModel(USER_MODEL_UID);
 
     const settings = await pluginStore
       .get({ key: 'email' })
       .then((storeEmail) => storeEmail.email_confirmation.options);
 
     // Sanitize the template's user information
-    const sanitizedUserInfo = await sanitize.sanitizers.defaultSanitizeOutput(userSchema, user);
+    const sanitizedUserInfo = await sanitize.sanitizers.defaultSanitizeOutput(
+      {
+        schema: userSchema,
+        getModel: strapi.getModel.bind(strapi),
+      },
+      user
+    );
 
     const confirmationToken = crypto.randomBytes(20).toString('hex');
 
@@ -112,9 +173,13 @@ module.exports = ({ strapi }) => ({
 
     try {
       settings.message = await userPermissionService.template(settings.message, {
-        URL: urlJoin(getAbsoluteServerUrl(strapi.config), apiPrefix, '/auth/email-confirmation'),
-        SERVER_URL: getAbsoluteServerUrl(strapi.config),
-        ADMIN_URL: getAbsoluteAdminUrl(strapi.config),
+        URL: urlJoin(
+          strapi.config.get('server.absoluteUrl'),
+          apiPrefix,
+          '/auth/email-confirmation'
+        ),
+        SERVER_URL: strapi.config.get('server.absoluteUrl'),
+        ADMIN_URL: strapi.config.get('admin.absoluteUrl'),
         USER: sanitizedUserInfo,
         CODE: confirmationToken,
       });

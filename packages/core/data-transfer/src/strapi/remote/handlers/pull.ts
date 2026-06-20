@@ -1,11 +1,21 @@
 import { Readable } from 'stream';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
+import type { Core } from '@strapi/types';
 
 import { Handler } from './abstract';
 import { handlerControllerFactory, isDataTransferMessage } from './utils';
-import { createLocalStrapiSourceProvider, ILocalStrapiSourceProvider } from '../../providers';
+import {
+  createTransferAssetStreamChunk,
+  transferAssetStreamChunkByteLength,
+} from '../../../utils/transfer-asset-chunk';
+import {
+  createLocalStrapiSourceProvider,
+  estimateAssetTotals,
+  ILocalStrapiSourceProvider,
+} from '../../providers';
 import { ProviderTransferError } from '../../../errors/providers';
-import type { IAsset, TransferStage, Protocol } from '../../../../types';
+import type { IAsset, StageTotalsEstimate, TransferStage, Protocol } from '../../../types';
+import { Client } from '../../../types/remote/protocol';
 
 const TRANSFER_KIND = 'pull';
 const VALID_TRANSFER_ACTIONS = ['bootstrap', 'close', 'getMetadata', 'getSchemas'] as const;
@@ -16,12 +26,13 @@ export interface PullHandler extends Handler {
   provider?: ILocalStrapiSourceProvider;
 
   streams?: { [stage in TransferStage]?: Readable };
+  checksumsEnabled?: boolean;
 
   assertValidTransferAction(action: string): asserts action is PullTransferAction;
 
-  onTransferMessage(msg: Protocol.client.TransferMessage): Promise<unknown> | unknown;
-  onTransferAction(msg: Protocol.client.Action): Promise<unknown> | unknown;
-  onTransferStep(msg: Protocol.client.TransferPullMessage): Promise<unknown> | unknown;
+  onTransferMessage(msg: Protocol.Client.TransferMessage): Promise<unknown> | unknown;
+  onTransferAction(msg: Protocol.Client.Action): Promise<unknown> | unknown;
+  onTransferStep(msg: Protocol.Client.TransferPullMessage): Promise<unknown> | unknown;
 
   createReadableStreamForStep(step: TransferStage): Promise<void>;
 
@@ -41,8 +52,43 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
     proto.cleanup.call(this);
 
     this.streams = {};
+    this.checksumsEnabled = false;
 
     delete this.provider;
+  },
+
+  onInfo(message) {
+    this.diagnostics?.report({
+      details: {
+        message,
+        origin: 'pull-handler',
+        createdAt: new Date(),
+      },
+      kind: 'info',
+    });
+  },
+  onWarning(message) {
+    this.diagnostics?.report({
+      details: {
+        message,
+        createdAt: new Date(),
+        origin: 'pull-handler',
+      },
+      kind: 'warning',
+    });
+  },
+
+  onError(error) {
+    this.diagnostics?.report({
+      details: {
+        message: error.message,
+        error,
+        createdAt: new Date(),
+        name: error.name,
+        severity: 'fatal',
+      },
+      kind: 'error',
+    });
   },
 
   assertValidTransferAction(this: PullHandler, action) {
@@ -70,12 +116,20 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
       await this.respond(undefined, new Error('Missing uuid in message'));
     }
 
-    const { uuid, type } = msg;
+    if (proto.hasUUID(msg.uuid)) {
+      const previousResponse = proto.response;
+      if (previousResponse?.uuid === msg.uuid) {
+        await this.respond(previousResponse?.uuid, previousResponse.e, previousResponse.data);
+      }
+      return;
+    }
 
+    const { uuid, type } = msg;
+    proto.addUUID(uuid);
     // Regular command message (init, end, status)
     if (type === 'command') {
       const { command } = msg;
-
+      this.onInfo(`received command:${command} uuid:${uuid}`);
       await this.executeAndRespond(uuid, () => {
         this.assertValidTransferCommand(command);
 
@@ -90,6 +144,7 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
 
     // Transfer message (the transfer must be init first)
     else if (type === 'transfer') {
+      this.onInfo(`received transfer action:${msg.action} step:${msg.kind} uuid:${uuid}`);
       await this.executeAndRespond(uuid, async () => {
         await this.verifyAuth();
 
@@ -113,7 +168,7 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
     }
 
     if (kind === 'step') {
-      return this.onTransferStep(msg as Protocol.client.TransferPullMessage);
+      return this.onTransferStep(msg as Protocol.Client.TransferPullMessage);
     }
   },
 
@@ -122,25 +177,73 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
 
     this.assertValidTransferAction(action);
 
+    if (action === 'bootstrap') {
+      return this.provider?.[action](this.diagnostics);
+    }
     return this.provider?.[action]();
   },
 
-  // TODO: Optimize performances (batching, client packets reconstruction, etc...)
-  async flush(this: PullHandler, stage: TransferStage, id) {
+  async flush(this: PullHandler, stage: Client.TransferPullStep, id) {
+    type Stage = typeof stage;
+    const batchSize = 1024 * 1024;
+    let batch = [] as Client.GetTransferPullStreamData<Stage>;
     const stream = this.streams?.[stage];
 
-    if (!stream) {
-      throw new ProviderTransferError(`No available stream found for ${stage}`);
-    }
+    const batchLength = () => Buffer.byteLength(JSON.stringify(batch));
+
+    const maybeConfirm = async (data: any) => {
+      try {
+        await this.confirm(data);
+      } catch (error) {
+        // Handle the error, log it, or take other appropriate actions
+
+        strapi?.log.error(
+          `[Data transfer] Message confirmation failed: ${(error as Error)?.message}`
+        );
+        this.onError(error as Error);
+      }
+    };
+
+    const sendBatch = async () => {
+      await this.confirm({
+        type: 'transfer',
+        data: batch,
+        ended: false,
+        error: null,
+        id,
+      });
+      batch = [];
+    };
 
     try {
-      for await (const chunk of stream) {
-        await this.confirm({ type: 'transfer', data: chunk, ended: false, error: null, id });
+      if (!stream) {
+        throw new ProviderTransferError(`No available stream found for ${stage}`);
       }
 
+      for await (const chunk of stream) {
+        if (stage !== 'assets') {
+          batch.push(chunk);
+          if (batchLength() >= batchSize) {
+            await sendBatch();
+          }
+        } else {
+          await this.confirm({
+            type: 'transfer',
+            data: [chunk],
+            ended: false,
+            error: null,
+            id,
+          });
+        }
+      }
+
+      if (batch.length > 0 && stage !== 'assets') {
+        await sendBatch();
+      }
       await this.confirm({ type: 'transfer', data: null, ended: true, error: null, id });
     } catch (e) {
-      await this.confirm({ type: 'transfer', data: null, ended: true, error: e, id });
+      // TODO: if this confirm fails, can we abort the whole transfer?
+      await maybeConfirm({ type: 'transfer', data: null, ended: true, error: e, id });
     }
   },
 
@@ -154,11 +257,20 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
 
       const flushUUID = randomUUID();
 
+      let totals: StageTotalsEstimate | undefined;
+      if (step === 'assets') {
+        totals = await estimateAssetTotals(strapi as Core.Strapi);
+      }
       await this.createReadableStreamForStep(step);
+      Promise.resolve(this.flush(step, flushUUID)).catch((err: unknown) => {
+        this.onError(err instanceof Error ? err : new Error(String(err)));
+      });
 
-      this.flush(step, flushUUID);
-
-      return { ok: true, id: flushUUID };
+      return {
+        ok: true,
+        id: flushUUID,
+        ...(totals !== undefined ? { totals } : {}),
+      };
     }
 
     if (action === 'end') {
@@ -183,18 +295,61 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
       configuration: () => this.provider?.createConfigurationReadStream(),
       assets: () => {
         const assets = this.provider?.createAssetsReadStream();
+        let batch: Protocol.Client.TransferAssetFlow[] = [];
+        const checksumsEnabled = this.checksumsEnabled === true;
+
+        const batchLength = () => {
+          return batch.reduce((acc, chunk) => acc + transferAssetStreamChunkByteLength(chunk), 0);
+        };
+
+        const BATCH_MAX_SIZE = 1024 * 1024; // 1MB
 
         if (!assets) {
-          throw new Error('bad');
+          throw new Error('Assets read stream could not be created');
         }
-
+        /**
+         * Generates batches of 1MB of data from the assets stream to avoid
+         * sending too many small chunks
+         *
+         * @param stream Assets stream from the local source provider
+         */
         async function* generator(stream: Readable) {
+          let hasStarted = false;
+          let assetID = '';
+          let assetChecksum: ReturnType<typeof createHash> | undefined;
+
           for await (const chunk of stream) {
-            const { stream: assetStream, ...rest } = chunk as IAsset;
+            const { stream: assetStream, ...assetData } = chunk as IAsset;
+            if (!hasStarted) {
+              assetID = randomUUID();
+              assetChecksum = checksumsEnabled ? createHash('sha256') : undefined;
+              // Start the transfer of a new asset
+              batch.push({ action: 'start', assetID, data: assetData });
+              hasStarted = true;
+            }
 
             for await (const assetChunk of assetStream) {
-              yield { ...rest, chunk: assetChunk };
+              assetChecksum?.update(assetChunk);
+              batch.push(createTransferAssetStreamChunk(assetID, assetChunk));
+
+              // if the batch size is bigger than BATCH_MAX_SIZE stream the batch
+              if (batchLength() >= BATCH_MAX_SIZE) {
+                yield batch;
+                batch = [];
+              }
             }
+
+            // All the asset data has been streamed and gets ready for the next one
+            hasStarted = false;
+            batch.push({
+              action: 'end',
+              assetID,
+              ...(assetChecksum
+                ? { checksum: { algorithm: 'sha256' as const, value: assetChecksum.digest('hex') } }
+                : {}),
+            });
+            yield batch;
+            batch = [];
           }
         }
 
@@ -214,7 +369,7 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
   },
 
   // Commands
-  async init(this: PullHandler) {
+  async init(this: PullHandler, params?: Protocol.Client.GetCommandParams<'init'>) {
     if (this.transferID || this.provider) {
       throw new Error('Transfer already in progress');
     }
@@ -222,24 +377,25 @@ export const createPullController = handlerControllerFactory<Partial<PullHandler
 
     this.transferID = randomUUID();
     this.startedAt = Date.now();
+    this.checksumsEnabled = params?.checksums === true;
 
     this.streams = {};
 
     this.provider = createLocalStrapiSourceProvider({
       autoDestroy: false,
-      getStrapi: () => strapi,
+      getStrapi: () => strapi as Core.Strapi,
     });
 
-    return { transferID: this.transferID };
+    return { transferID: this.transferID, checksums: true };
   },
 
   async end(
     this: PullHandler,
-    params: Protocol.client.GetCommandParams<'end'>
-  ): Promise<Protocol.server.Payload<Protocol.server.EndMessage>> {
+    params: Protocol.Client.GetCommandParams<'end'>
+  ): Promise<Protocol.Server.Payload<Protocol.Server.EndMessage>> {
     await this.verifyAuth();
 
-    if (this.transferID !== params.transferID) {
+    if (this.transferID !== params?.transferID) {
       throw new ProviderTransferError('Bad transfer ID provided');
     }
 

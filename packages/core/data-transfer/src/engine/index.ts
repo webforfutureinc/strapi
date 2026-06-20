@@ -1,12 +1,13 @@
 import { PassThrough, Transform, Readable, Writable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { extname } from 'path';
 import { EOL } from 'os';
-import { isEmpty, uniq, last, isNumber, difference, omit, set } from 'lodash/fp';
-import { diff as semverDiff } from 'semver';
-import type { Schema } from '@strapi/strapi';
-import { chain } from 'stream-chain';
 import type Chain from 'stream-chain';
-import * as utils from '../utils';
+import { chain } from 'stream-chain';
+import { isEmpty, uniq, last, isNumber, set, pick } from 'lodash/fp';
+import { diff as semverDiff } from 'semver';
+
+import type { Struct, Utils } from '@strapi/types';
 
 import type {
   IAsset,
@@ -24,24 +25,28 @@ import type {
   IProvider,
   TransferFilters,
   TransferFilterPreset,
+  StreamItem,
   SchemaDiffHandler,
   SchemaDiffHandlerContext,
-  SchemaMap,
-  StreamItem,
-} from '../../types';
+  ErrorHandler,
+  ErrorHandlerContext,
+  ErrorHandlers,
+  ErrorCode,
+  StageProgress,
+} from '../types';
 import type { Diff } from '../utils/json';
 
 import { compareSchemas, validateProvider } from './validation';
-import { filter, map } from '../utils/stream';
 
 import { TransferEngineError, TransferEngineValidationError } from './errors';
 import {
   createDiagnosticReporter,
   IDiagnosticReporter,
   ErrorDiagnosticSeverity,
-} from './diagnostic';
+} from '../utils/diagnostic';
 import { DataTransferError } from '../errors';
-import { runMiddleware } from '../utils/middleware';
+import * as utils from '../utils';
+import { ProviderTransferError } from '../errors/providers';
 
 export const TRANSFER_STAGES: ReadonlyArray<TransferStage> = Object.freeze([
   'entities',
@@ -72,7 +77,6 @@ export const TransferGroupPresets: TransferGroupFilter = {
   },
   files: {
     assets: true,
-    links: true,
   },
   config: {
     configuration: true,
@@ -82,12 +86,11 @@ export const TransferGroupPresets: TransferGroupFilter = {
 export const DEFAULT_VERSION_STRATEGY = 'ignore';
 export const DEFAULT_SCHEMA_STRATEGY = 'strict';
 
-/**
- * Transfer Engine Class
- */
+type SchemaMap = Utils.String.Dict<Struct.Schema>;
+
 class TransferEngine<
   S extends ISourceProvider = ISourceProvider,
-  D extends IDestinationProvider = IDestinationProvider
+  D extends IDestinationProvider = IDestinationProvider,
 > implements ITransferEngine
 {
   sourceProvider: ISourceProvider;
@@ -112,16 +115,39 @@ class TransferEngine<
 
   #handlers: {
     schemaDiff: SchemaDiffHandler[];
+    errors: Partial<ErrorHandlers>;
   } = {
     schemaDiff: [],
+    errors: {},
   };
+
+  #currentStreamController?: AbortController;
+
+  #aborted: boolean = false;
 
   onSchemaDiff(handler: SchemaDiffHandler) {
     this.#handlers?.schemaDiff?.push(handler);
   }
 
-  // Save the currently open stream so that we can access it at any time
-  #currentStream?: Writable;
+  addErrorHandler(handlerName: ErrorCode, handler: ErrorHandler) {
+    if (!this.#handlers.errors[handlerName]) {
+      this.#handlers.errors[handlerName] = [];
+    }
+    this.#handlers.errors[handlerName]?.push(handler);
+  }
+
+  async attemptResolveError(error: Error) {
+    const context: ErrorHandlerContext = {};
+    if (error instanceof ProviderTransferError && error.details?.details.code) {
+      const errorCode = error.details?.details.code as ErrorCode;
+      if (!this.#handlers.errors[errorCode]) {
+        this.#handlers.errors[errorCode] = [];
+      }
+      await utils.middleware.runMiddleware(context ?? {}, this.#handlers.errors[errorCode] ?? []);
+    }
+
+    return !!context.ignore;
+  }
 
   constructor(sourceProvider: S, destinationProvider: D, options: ITransferEngineOptions) {
     this.diagnostics = createDiagnosticReporter();
@@ -177,7 +203,7 @@ class TransferEngine<
   reportInfo(message: string, params?: unknown) {
     this.diagnostics.report({
       kind: 'info',
-      details: { createdAt: new Date(), message, params },
+      details: { createdAt: new Date(), message, params, origin: 'engine' },
     });
   }
 
@@ -200,11 +226,11 @@ class TransferEngine<
       const chainTransforms: StreamItem[] = [];
       for (const transform of transforms) {
         if ('filter' in transform) {
-          chainTransforms.push(filter(transform.filter));
+          chainTransforms.push(utils.stream.filter(transform.filter));
         }
 
         if ('map' in transform) {
-          chainTransforms.push(map(transform.map));
+          chainTransforms.push(utils.stream.map(transform.map));
         }
       }
       if (chainTransforms.length) {
@@ -282,8 +308,7 @@ class TransferEngine<
   }
 
   /**
-   * Create and return a PassThrough stream.
-   *
+   * Create and return a PassThrough stream for per-object progress tracking.
    * Upon writing data into it, it'll update the Engine's transfer progress data and trigger stage update events.
    */
   #progressTracker(
@@ -302,6 +327,90 @@ class TransferEngine<
       },
     });
   }
+
+  /**
+   * Create and return a PassThrough stream for per-chunk progress tracking (used for assets).
+   * Pipes each asset's binary stream through a Transform that counts bytes and forwards chunks,
+   * then replaces asset.stream with that transform so the destination has a single consumer.
+   * This avoids consuming the stream (which would leave the destination with an empty stream)
+   * and ensures backpressure is applied so memory is not held for the entire transfer.
+   */
+  #progressTrackerChunks(
+    stage: TransferStage,
+    aggregate?: {
+      key?(value: unknown): string;
+    }
+  ) {
+    const updateAggregateBytes = this.#updateAggregateBytes.bind(this);
+    const incrementAggregateCount = this.#incrementAggregateCount.bind(this);
+    const emitStageUpdate = this.#emitStageUpdate.bind(this);
+
+    return new PassThrough({
+      objectMode: true,
+      transform: (asset, _encoding, callback) => {
+        if (!asset?.stream || typeof asset.stream.pipe !== 'function') {
+          return callback(null, asset);
+        }
+
+        const key = aggregate?.key?.(asset);
+        if (!this.progress.data[stage]) {
+          this.progress.data[stage] = { count: 0, bytes: 0, startTime: Date.now() };
+        }
+        const stageProgress = this.progress.data[stage];
+
+        if (!stageProgress) {
+          throw new TransferEngineError('fatal', 'Stage progress data not found');
+        }
+
+        const progressTransform = new Transform({
+          objectMode: true,
+          transform(chunk: Buffer | unknown, _enc, cb) {
+            // Asset file reads should yield Buffers; avoid skewing totals if not.
+            const byteLength = Buffer.isBuffer(chunk) ? chunk.length : 1;
+            stageProgress.bytes += byteLength;
+            if (key) {
+              updateAggregateBytes(stageProgress, key, byteLength);
+            }
+            emitStageUpdate('progress', stage);
+            cb(null, chunk);
+          },
+          flush(cb) {
+            stageProgress.count += 1;
+            if (key) {
+              incrementAggregateCount(stageProgress, key);
+            }
+            emitStageUpdate('progress', stage);
+            cb(null);
+          },
+        });
+
+        asset.stream.on('error', (err: Error) => progressTransform.destroy(err));
+        asset.stream.pipe(progressTransform);
+        asset.stream = progressTransform;
+        callback(null, asset);
+      },
+    });
+  }
+
+  #updateAggregateBytes = (stageProgress: StageProgress, key: string, bytes: number) => {
+    if (!stageProgress.aggregates) {
+      stageProgress.aggregates = {};
+    }
+    if (!stageProgress.aggregates[key]) {
+      stageProgress.aggregates[key] = { count: 0, bytes: 0 };
+    }
+    stageProgress.aggregates[key].bytes += bytes;
+  };
+
+  #incrementAggregateCount = (stageProgress: StageProgress, key: string) => {
+    if (!stageProgress.aggregates) {
+      stageProgress.aggregates = {};
+    }
+    if (!stageProgress.aggregates[key]) {
+      stageProgress.aggregates[key] = { count: 0, bytes: 0 };
+    }
+    stageProgress.aggregates[key].count += 1;
+  };
 
   /**
    * Shorthand method used to trigger transfer update events to every listeners
@@ -399,7 +508,7 @@ class TransferEngine<
       const schemaDiffs = compareSchemas(sourceSchema, destinationSchema, strategy);
 
       if (schemaDiffs.length) {
-        diffs[key] = schemaDiffs as Diff<Schema>[];
+        diffs[key] = schemaDiffs as Diff<Struct.Schema>[];
       }
     });
 
@@ -461,13 +570,13 @@ class TransferEngine<
 
     // everything is included by default unless 'only' has been set
     let included = isEmpty(only);
-    if (only?.length > 0) {
+    if (only && only.length > 0) {
       included = only.some((transferGroup) => {
         return TransferGroupPresets[transferGroup][stage];
       });
     }
 
-    if (exclude?.length > 0) {
+    if (exclude && exclude.length > 0) {
       if (included) {
         included = !exclude.some((transferGroup) => {
           return TransferGroupPresets[transferGroup][stage];
@@ -485,6 +594,10 @@ class TransferEngine<
     transform?: PassThrough | Chain;
     tracker?: PassThrough;
   }) {
+    if (this.#aborted) {
+      throw new TransferEngineError('fatal', 'Transfer aborted.');
+    }
+
     const { stage, source, destination, transform, tracker } = options;
 
     const updateEndTime = () => {
@@ -524,43 +637,53 @@ class TransferEngine<
 
     this.#emitStageUpdate('start', stage);
 
-    await new Promise<void>((resolve, reject) => {
-      let stream: Readable = source;
+    try {
+      const streams: (Readable | Writable)[] = [source];
 
       if (transform) {
-        stream = stream.pipe(transform);
+        streams.push(transform);
       }
-
       if (tracker) {
-        stream = stream.pipe(tracker);
+        streams.push(tracker);
       }
 
-      this.#currentStream = stream
-        .pipe(destination)
-        .on('error', (e) => {
-          updateEndTime();
-          this.#emitStageUpdate('error', stage);
-          this.reportError(e, 'error');
-          destination.destroy(e);
-          reject(e);
-        })
-        .on('close', () => {
-          this.#currentStream = undefined;
-          updateEndTime();
-          resolve();
-        });
-    });
+      streams.push(destination);
 
-    this.#emitStageUpdate('finish', stage);
+      // NOTE: to debug/confirm backpressure issues from misbehaving stream, uncomment the following lines
+      // source.on('pause', () => console.log(`[${stage}] Source paused due to backpressure`));
+      // source.on('resume', () => console.log(`[${stage}] Source resumed`));
+      // destination.on('drain', () =>
+      //   console.log(`[${stage}] Destination drained, resuming data flow`)
+      // );
+      // destination.on('error', (err) => console.error(`[${stage}] Destination error:`, err));
+
+      const controller = new AbortController();
+      const { signal } = controller;
+
+      // Store the controller so you can cancel later
+      this.#currentStreamController = controller;
+
+      await pipeline(streams, { signal });
+
+      this.#emitStageUpdate('finish', stage);
+    } catch (e) {
+      updateEndTime();
+      this.#emitStageUpdate('error', stage);
+      this.reportError(e as Error, 'error');
+      if (!destination.destroyed) {
+        destination.destroy(e as Error);
+      }
+      throw e;
+    } finally {
+      updateEndTime();
+    }
   }
 
   // Cause an ongoing transfer to abort gracefully
   async abortTransfer(): Promise<void> {
-    const err = new TransferEngineError('fatal', 'Transfer aborted.');
-    if (!this.#currentStream) {
-      throw err;
-    }
-    this.#currentStream.destroy(err);
+    this.#aborted = true;
+    this.#currentStreamController?.abort();
+    throw new TransferEngineError('fatal', 'Transfer aborted.');
   }
 
   async init(): Promise<void> {
@@ -581,8 +704,8 @@ class TransferEngine<
    */
   async bootstrap(): Promise<void> {
     const results = await Promise.allSettled([
-      this.sourceProvider.bootstrap?.(),
-      this.destinationProvider.bootstrap?.(),
+      this.sourceProvider.bootstrap?.(this.diagnostics),
+      this.destinationProvider.bootstrap?.(this.diagnostics),
     ]);
 
     results.forEach((result) => {
@@ -631,8 +754,8 @@ class TransferEngine<
     }
 
     return {
-      sourceSchema: this.#schema.source,
-      destinationSchema: this.#schema.destination,
+      sourceSchemas: this.#schema.source,
+      destinationSchemas: this.#schema.destination,
     };
   }
 
@@ -647,11 +770,11 @@ class TransferEngine<
       );
     }
 
-    const { sourceSchema, destinationSchema } = await this.#getSchemas();
+    const { sourceSchemas, destinationSchemas } = await this.#getSchemas();
 
     try {
-      if (sourceSchema && destinationSchema) {
-        this.#assertSchemasMatching(sourceSchema, destinationSchema);
+      if (sourceSchemas && destinationSchemas) {
+        this.#assertSchemasMatching(sourceSchemas, destinationSchemas);
       }
     } catch (error) {
       // if this is a schema matching error, allow handlers to resolve it
@@ -670,7 +793,10 @@ class TransferEngine<
           throw error;
         }
 
-        await runMiddleware<SchemaDiffHandlerContext>(context, this.#handlers.schemaDiff);
+        await utils.middleware.runMiddleware<SchemaDiffHandlerContext>(
+          context,
+          this.#handlers.schemaDiff
+        );
 
         // if there are any remaining diffs that weren't ignored
         const unresolvedDiffs = utils.json.diff(context.diffs, context.ignoredDiffs);
@@ -746,8 +872,12 @@ class TransferEngine<
       try {
         await provider.beforeTransfer?.();
       } catch (error) {
-        // Error happening during the before transfer step should be considered fatal errors
         if (error instanceof Error) {
+          const resolved = await this.attemptResolveError(error);
+
+          if (resolved) {
+            return;
+          }
           this.panic(error);
         } else {
           this.panic(
@@ -763,18 +893,26 @@ class TransferEngine<
 
   async transferSchemas(): Promise<void> {
     const stage: TransferStage = 'schemas';
+    if (this.shouldSkipStage(stage)) {
+      return;
+    }
 
     const source = await this.sourceProvider.createSchemasReadStream?.();
     const destination = await this.destinationProvider.createSchemasWriteStream?.();
 
     const transform = this.#createStageTransformStream(stage);
-    const tracker = this.#progressTracker(stage, { key: (value: Schema) => value.modelType });
+    const tracker = this.#progressTracker(stage, {
+      key: (value: Struct.Schema) => value.modelType,
+    });
 
     await this.#transferStage({ stage, source, destination, transform, tracker });
   }
 
   async transferEntities(): Promise<void> {
     const stage: TransferStage = 'entities';
+    if (this.shouldSkipStage(stage)) {
+      return;
+    }
 
     const source = await this.sourceProvider.createEntitiesReadStream?.();
     const destination = await this.destinationProvider.createEntitiesWriteStream?.();
@@ -784,7 +922,7 @@ class TransferEngine<
       new Transform({
         objectMode: true,
         transform: async (entity: IEntity, _encoding, callback) => {
-          const { destinationSchema: schemas } = await this.#getSchemas();
+          const { destinationSchemas: schemas } = await this.#getSchemas();
 
           if (!schemas) {
             return callback(null, entity);
@@ -801,10 +939,9 @@ class TransferEngine<
           }
 
           const { type, data } = entity;
-          const attributes = (schemas[type] as Record<string, unknown>).attributes as object;
-
-          const attributesToRemove = difference(Object.keys(data), Object.keys(attributes));
-          const updatedEntity = set('data', omit(attributesToRemove, data), entity);
+          const attributes = schemas[type].attributes;
+          const attributesToKeep = Object.keys(attributes).concat('documentId');
+          const updatedEntity = set('data', pick(attributesToKeep, data), entity);
 
           callback(null, updatedEntity);
         },
@@ -818,6 +955,9 @@ class TransferEngine<
 
   async transferLinks(): Promise<void> {
     const stage: TransferStage = 'links';
+    if (this.shouldSkipStage(stage)) {
+      return;
+    }
 
     const source = await this.sourceProvider.createLinksReadStream?.();
     const destination = await this.destinationProvider.createLinksWriteStream?.();
@@ -827,16 +967,13 @@ class TransferEngine<
       new Transform({
         objectMode: true,
         transform: async (link: ILink, _encoding, callback) => {
-          const { destinationSchema: schemas } = await this.#getSchemas();
-
+          const { destinationSchemas: schemas } = await this.#getSchemas();
           if (!schemas) {
             return callback(null, link);
           }
 
           // TODO: this would be safer if we only ignored things in ignoredDiffs, otherwise continue and let an error be thrown
-          const availableContentTypes = Object.entries(schemas)
-            .filter(([, schema]) => schema.modelType === 'contentType')
-            .map(([uid]) => uid);
+          const availableContentTypes = Object.keys(schemas);
 
           const isValidType = (uid: string) => availableContentTypes.includes(uid);
 
@@ -864,16 +1001,46 @@ class TransferEngine<
     const destination = await this.destinationProvider.createAssetsWriteStream?.();
 
     const transform = this.#createStageTransformStream(stage);
-    const tracker = this.#progressTracker(stage, {
-      size: (value: IAsset) => value.stats.size,
+    const tracker = this.#progressTrackerChunks(stage, {
       key: (value: IAsset) => extname(value.filename) || 'No extension',
     });
 
+    await this.#mergeSourceStageTotals(stage);
     await this.#transferStage({ stage, source, destination, transform, tracker });
+  }
+
+  /**
+   * Merge optional source-reported totals into progress before the stage starts (CLI ETA / totals).
+   */
+  async #mergeSourceStageTotals(stage: TransferStage) {
+    const getTotals = this.sourceProvider.getStageTotals;
+    if (!getTotals) {
+      return;
+    }
+    const totals = await getTotals.call(this.sourceProvider, stage);
+    if (!totals || (totals.totalBytes == null && totals.totalCount == null)) {
+      return;
+    }
+    if (!this.progress.data[stage]) {
+      this.progress.data[stage] = { count: 0, bytes: 0, startTime: Date.now() };
+    }
+    const stageProgress = this.progress.data[stage];
+    if (!stageProgress) {
+      return;
+    }
+    if (totals.totalBytes != null) {
+      stageProgress.totalBytes = totals.totalBytes;
+    }
+    if (totals.totalCount != null) {
+      stageProgress.totalCount = totals.totalCount;
+    }
   }
 
   async transferConfiguration(): Promise<void> {
     const stage: TransferStage = 'configuration';
+    if (this.shouldSkipStage(stage)) {
+      return;
+    }
 
     const source = await this.sourceProvider.createConfigurationReadStream?.();
     const destination = await this.destinationProvider.createConfigurationWriteStream?.();
@@ -891,6 +1058,19 @@ export const createTransferEngine = <S extends ISourceProvider, D extends IDesti
   options: ITransferEngineOptions
 ): TransferEngine<S, D> => {
   return new TransferEngine<S, D>(sourceProvider, destinationProvider, options);
+};
+
+export type {
+  TransferEngine,
+  ITransferEngine,
+  ITransferEngineOptions,
+  ISourceProvider,
+  IDestinationProvider,
+  TransferStage,
+  TransferFilterPreset,
+  ErrorHandlerContext,
+  SchemaDiffHandlerContext,
+  ITransferResults,
 };
 
 export * as errors from './errors';

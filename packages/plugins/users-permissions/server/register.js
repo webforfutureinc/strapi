@@ -7,7 +7,7 @@ const authStrategy = require('./strategies/users-permissions');
 const sanitizers = require('./utils/sanitize/sanitizers');
 
 module.exports = ({ strapi }) => {
-  strapi.container.get('auth').register('content-api', authStrategy);
+  strapi.get('auth').register('content-api', authStrategy);
   strapi.sanitizers.add('content-api.output', sanitizers.defaultSanitizeOutput);
 
   if (strapi.plugin('graphql')) {
@@ -15,7 +15,7 @@ module.exports = ({ strapi }) => {
   }
 
   if (strapi.plugin('documentation')) {
-    const specPath = path.join(__dirname, '../documentation/content-api.yaml');
+    const specPath = path.join(__dirname, '../../documentation/content-api.yaml');
     const spec = fs.readFileSync(specPath, 'utf8');
 
     strapi

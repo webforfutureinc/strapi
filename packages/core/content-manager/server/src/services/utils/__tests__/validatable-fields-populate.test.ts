@@ -1,0 +1,304 @@
+import { getPopulateForValidation } from '../populate';
+
+describe('getPopulateForValidation', () => {
+  const fakeModels = {
+    empty: {
+      modelName: 'Fake empty model',
+      attributes: {},
+    },
+    scalarOnly: {
+      modelName: 'Fake scalar-only model',
+      attributes: {
+        title: { type: 'string', required: true },
+        description: { type: 'text', required: false },
+      },
+    },
+    componentWithRequiredFields: {
+      modelName: 'Fake component with required fields',
+      attributes: {
+        componentAttrName: {
+          type: 'component',
+          component: 'componentFields',
+        },
+      },
+    },
+    componentFields: {
+      modelName: 'Fake component fields',
+      attributes: {
+        subfield1: { type: 'string', required: true },
+        subfield2: { type: 'number', required: false },
+      },
+    },
+    componentWithoutRequiredFields: {
+      modelName: 'Fake component without required fields',
+      attributes: {
+        componentAttrName: {
+          type: 'component',
+          component: 'empty',
+        },
+      },
+    },
+    media: {
+      modelName: 'Fake media model',
+      attributes: {
+        mediaAttrName: {
+          required: true,
+          type: 'media',
+        },
+      },
+    },
+  } as any;
+
+  beforeEach(() => {
+    global.strapi = {
+      getModel: jest.fn((uid) => fakeModels[uid]),
+    } as any;
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('with empty model', () => {
+    const uid = 'empty';
+
+    const result = getPopulateForValidation(uid as any);
+
+    expect(result).toEqual({});
+  });
+
+  test('with scalar-only model', () => {
+    const uid = 'scalarOnly';
+
+    const result = getPopulateForValidation(uid as any);
+
+    expect(result).toEqual({
+      fields: ['title'], // Only scalar fields requiring validation
+    });
+  });
+
+  test('excludes top-level private required scalar fields', () => {
+    fakeModels.scalarWithPrivateRequired = {
+      modelName: 'Fake scalar model with private required field',
+      attributes: {
+        privateRequiredField: { type: 'string', required: true, private: true },
+        publicRequiredField: { type: 'string', required: true },
+      },
+    };
+
+    const result = getPopulateForValidation('scalarWithPrivateRequired' as any);
+
+    expect(result).toEqual({
+      fields: ['publicRequiredField'],
+    });
+  });
+
+  test('with media model', () => {
+    const uid = 'media';
+
+    const result = getPopulateForValidation(uid as any);
+
+    expect(result).toEqual({
+      populate: {
+        mediaAttrName: {
+          populate: {
+            folder: true,
+          },
+        },
+      },
+    });
+  });
+
+  test('excludes private required media fields', () => {
+    fakeModels.mediaWithPrivateRequired = {
+      modelName: 'Fake media model with private required field',
+      attributes: {
+        privateMedia: { type: 'media', required: true, private: true },
+        publicMedia: { type: 'media', required: true },
+      },
+    };
+
+    const result = getPopulateForValidation('mediaWithPrivateRequired' as any);
+
+    expect(result).toEqual({
+      populate: {
+        publicMedia: {
+          populate: {
+            folder: true,
+          },
+        },
+      },
+    });
+  });
+
+  describe('components', () => {
+    test('with component model containing required fields', () => {
+      const uid = 'componentWithRequiredFields';
+
+      const result = getPopulateForValidation(uid as any);
+
+      expect(result).toEqual({
+        populate: {
+          componentAttrName: {
+            fields: ['subfield1'], // Only required fields in the component
+          },
+        },
+      });
+    });
+
+    test('with component model without required fields', () => {
+      const uid = 'componentWithoutRequiredFields';
+
+      const result = getPopulateForValidation(uid as any);
+
+      expect(result).toEqual({}); // No required fields, so no populate
+    });
+
+    test('with component model containing private required fields', () => {
+      fakeModels.componentWithPrivateRequiredFields = {
+        modelName: 'Fake component with private required fields',
+        attributes: {
+          componentAttrName: {
+            type: 'component',
+            component: 'componentWithPrivateFields',
+          },
+        },
+      };
+
+      fakeModels.componentWithPrivateFields = {
+        modelName: 'Fake component with private fields',
+        attributes: {
+          privateRequiredField: { type: 'string', required: true, private: true },
+          publicRequiredField: { type: 'string', required: true },
+          privateOptionalField: { type: 'string', required: false, private: true },
+        },
+      };
+
+      const uid = 'componentWithPrivateRequiredFields';
+
+      const result = getPopulateForValidation(uid as any);
+
+      expect(result).toEqual({
+        populate: {
+          componentAttrName: {
+            fields: ['publicRequiredField'],
+          },
+        },
+      });
+    });
+
+    test('with nested components', () => {
+      fakeModels.nestedComponent = {
+        modelName: 'Fake nested component model',
+        attributes: {
+          nestedComponentAttr: {
+            type: 'component',
+            component: 'componentFields',
+          },
+        },
+      };
+
+      fakeModels.parentModel = {
+        modelName: 'Fake parent model',
+        attributes: {
+          parentComponent: {
+            type: 'component',
+            component: 'nestedComponent',
+          },
+        },
+      };
+
+      const uid = 'parentModel';
+
+      const result = getPopulateForValidation(uid as any);
+
+      expect(result).toEqual({
+        populate: {
+          parentComponent: {
+            populate: {
+              nestedComponentAttr: {
+                fields: ['subfield1'],
+              },
+            },
+          },
+        },
+      });
+    });
+  });
+
+  describe('dynamic zones', () => {
+    fakeModels.dynamicZone = {
+      modelName: 'Fake dynamic zone model',
+      attributes: {
+        dynZoneAttrName: {
+          type: 'dynamiczone',
+          components: [
+            'componentFields',
+            'componentWithRequiredFields',
+            'componentWithoutRequiredFields',
+          ],
+        },
+      },
+    };
+
+    test('with dynamic zone model', () => {
+      const uid = 'dynamicZone';
+
+      const result = getPopulateForValidation(uid as any);
+
+      expect(result).toEqual({
+        populate: {
+          dynZoneAttrName: {
+            on: {
+              componentFields: {
+                fields: ['subfield1'],
+              },
+              componentWithRequiredFields: {
+                populate: {
+                  componentAttrName: {
+                    fields: ['subfield1'],
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+    });
+
+    test('excludes private required fields from dynamic zone components', () => {
+      fakeModels.componentWithPrivateFields = {
+        modelName: 'Fake component with private fields',
+        attributes: {
+          privateRequiredField: { type: 'string', required: true, private: true },
+          publicRequiredField: { type: 'string', required: true },
+          privateOptionalField: { type: 'string', required: false, private: true },
+        },
+      };
+
+      fakeModels.dynamicZoneWithPrivateComponent = {
+        modelName: 'Fake dynamic zone with private component fields',
+        attributes: {
+          dynZoneAttrName: {
+            type: 'dynamiczone',
+            components: ['componentWithPrivateFields'],
+          },
+        },
+      };
+
+      const result = getPopulateForValidation('dynamicZoneWithPrivateComponent' as any);
+
+      expect(result).toEqual({
+        populate: {
+          dynZoneAttrName: {
+            on: {
+              componentWithPrivateFields: {
+                fields: ['publicRequiredField'],
+              },
+            },
+          },
+        },
+      });
+    });
+  });
+});

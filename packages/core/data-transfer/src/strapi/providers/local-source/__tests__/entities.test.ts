@@ -1,5 +1,5 @@
-import { Readable, PassThrough } from 'stream';
-import type { IEntity } from '../../../../../types';
+import { Readable, Transform } from 'stream';
+import type { IEntity } from '../../../../types';
 
 import {
   collect,
@@ -85,6 +85,56 @@ describe('Local Strapi Source Provider - Entities Streaming', () => {
         );
       });
     });
+
+    test('Should warn and continue with the next content type when a stream fails', async () => {
+      const queryBuilder = jest.fn((uid: string) => ({
+        select() {
+          return this;
+        },
+        populate() {
+          return this;
+        },
+        stream() {
+          if (uid === 'foo') {
+            // Stream one entity, then fail mid-stream
+            return Readable.from(
+              (async function* fooGenerator() {
+                yield { id: 1, title: 'First title' };
+                throw new Error('connection lost');
+              })()
+            );
+          }
+
+          return Readable.from([
+            { id: 1, age: 42 },
+            { id: 2, age: 84 },
+          ]);
+        },
+      }));
+
+      const contentTypes = getContentTypes();
+      const strapi = getStrapiFactory({
+        contentTypes,
+        db: { queryBuilder },
+        getModel: jest.fn((uid) => {
+          return contentTypes[uid];
+        }),
+      })();
+
+      const onWarning = jest.fn();
+      const entitiesStream = createEntitiesStream(strapi, { onWarning });
+
+      const results = await collect(entitiesStream);
+
+      // The first "foo" entity was streamed before the failure, and both
+      // "bar" entities must still be streamed afterwards
+      expect(results).toHaveLength(3);
+
+      // The failure must be reported instead of silently swallowed
+      expect(onWarning).toHaveBeenCalledTimes(1);
+      expect(onWarning).toHaveBeenCalledWith(expect.stringContaining('"foo"'));
+      expect(onWarning).toHaveBeenCalledWith(expect.stringContaining('connection lost'));
+    });
   });
 
   describe('Create Entities Transform Stream', () => {
@@ -128,7 +178,7 @@ describe('Local Strapi Source Provider - Entities Streaming', () => {
       const entitiesStream = Readable.from(entities);
       const transformStream = createEntitiesTransformStream();
 
-      expect(transformStream).toBeInstanceOf(PassThrough);
+      expect(transformStream).toBeInstanceOf(Transform);
 
       // Connect the data source to the transformation stream
       const pipeline = entitiesStream.pipe(transformStream);

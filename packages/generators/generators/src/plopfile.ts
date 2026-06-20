@@ -1,10 +1,9 @@
 import pluralize from 'pluralize';
-import { NodePlopAPI } from 'plop';
+import type { NodePlopAPI } from 'plop';
 
 import generateApi from './plops/api';
 import generateController from './plops/controller';
 import generateContentType from './plops/content-type';
-import generatePlugin from './plops/plugin';
 import generatePolicy from './plops/policy';
 import generateMiddleware from './plops/middleware';
 import generateMigration from './plops/migration';
@@ -13,13 +12,12 @@ import generateService from './plops/service';
 export default (plop: NodePlopAPI) => {
   // Plop config
   plop.setWelcomeMessage('Strapi Generators');
-  plop.addHelper('pluralize', (text: string) => pluralize(text));
+  plop.setHelper('pluralize', (text: string) => pluralize(text));
 
   // Generators
   generateApi(plop);
   generateController(plop);
   generateContentType(plop);
-  generatePlugin(plop);
   generatePolicy(plop);
   generateMiddleware(plop);
   generateMigration(plop);

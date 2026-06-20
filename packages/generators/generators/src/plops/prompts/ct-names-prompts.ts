@@ -1,8 +1,6 @@
 import pluralize from 'pluralize';
 import slugify from '@sindresorhus/slugify';
-import utils from '@strapi/utils';
-
-import type { PromptQuestion } from 'node-plop';
+import { strings } from '@strapi/utils';
 
 interface Answers {
   displayName: string;
@@ -10,7 +8,7 @@ interface Answers {
   pluralName: string;
 }
 
-const questions: Array<PromptQuestion> = [
+const questions = [
   {
     type: 'input',
     name: 'displayName',
@@ -22,8 +20,8 @@ const questions: Array<PromptQuestion> = [
     name: 'singularName',
     message: 'Content type singular name',
     default: (answers: Answers) => slugify(answers.displayName),
-    validate(input) {
-      if (!utils.isKebabCase(input)) {
+    validate(input: string) {
+      if (!strings.isKebabCase(input)) {
         return 'Value must be in kebab-case';
       }
 
@@ -40,7 +38,7 @@ const questions: Array<PromptQuestion> = [
         return 'Singular and plural names cannot be the same';
       }
 
-      if (!utils.isKebabCase(input)) {
+      if (!strings.isKebabCase(input)) {
         return 'Value must be in kebab-case';
       }
 

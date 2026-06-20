@@ -18,7 +18,7 @@ A Request For Comments has to be created on the [strapi/rfcs](https://github.com
 
 ## Code of Conduct
 
-This project, and everyone participating in it, are governed by the [Strapi Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold it. Make sure to read the [full text](CODE_OF_CONDUCT.md) to understand which type of actions may or may not be tolerated.
+This project, and everyone participating in it, are governed by the [Strapi Code of Conduct](https://github.com/strapi/strapi/blob/main/CODE_OF_CONDUCT.md). By participating, you are expected to uphold it. Make sure to read the [full text](https://github.com/strapi/strapi/blob/main/CODE_OF_CONDUCT.md) to understand which type of actions may or may not be tolerated.
 
 ## Contributor License Agreement (CLA)
 
@@ -32,7 +32,13 @@ If you make contributions to our repositories on behalf of your company, we will
 
 ## Documentation
 
+### Userland Documentation
+
 Pull requests related to fixing documentation for the latest release should be directed towards the [documentation repository](https://github.com/strapi/documentation). Please follow the [documentation contributing guide](https://github.com/strapi/documentation/blob/main/CONTRIBUTING.md) for more information.
+
+### Contributor Documentation
+
+You can access the contributor documentation from (`./docs`) online at [contributor.strapi.io](https://contributor.strapi.io/).
 
 ## Bugs
 
@@ -46,18 +52,21 @@ The Strapi core team will review your pull request and either merge it, request 
 
 ## Contribution Prerequisites
 
-- You have [Node.js](https://nodejs.org/en/) at version >= v14 and <= v18 and [Yarn](https://yarnpkg.com/en/) at v1.2.0+ installed.
+- You have [Node.js](https://nodejs.org/en/) at version `>= v22 and <= v26` and [Yarn](https://yarnpkg.com/en/) at v1.2.0+ installed.
 - You are familiar with [Git](https://git-scm.com).
 
 **Before submitting your pull request** make sure the following requirements are fulfilled:
 
-- Fork the repository and create your new branch from `main`.
+- Fork the repository and create your new branch from `develop`.
 - Run `yarn install` in the root of the repository.
 - Run `yarn setup` in the root of the repository.
 - If you've fixed a bug or added code that should be tested, please make sure to add tests
 - Ensure the following test suites are passing:
   - `yarn test:unit`
   - `yarn test:front`
+  - `yarn test:e2e --setup --concurrency=1`
+    - you **_may_** need to install Playwright browsers first: `yarn playwright install`
+    - Enterprise (EE) e2e: set `STRAPI_LICENSE` in **`tests/e2e/.env`** (see [`docs/docs/guides/e2e/00-setup.md`](docs/docs/guides/e2e/00-setup.md))
 - Make sure your code lints by running `yarn lint`.
 - If your contribution fixes an existing issue, please make sure to link it in your pull request.
 
@@ -99,10 +108,17 @@ Start the administration panel server for development:
 
 ```bash
 cd ./packages/core/admin
-yarn develop
+yarn watch
 ```
 
-The administration panel should now be available at http://localhost:4000/admin. Make sure the example application (step 4) is still running.
+Run the example application but watching the admin panel:
+
+```bash
+cd ./examples/getstarted
+yarn develop --watch-admin
+```
+
+Both commands must be running at same time; now you will be able to see the admin panel changes on the application example.
 
 **Awesome! You are now able to contribute to Strapi.**
 
@@ -110,6 +126,7 @@ The administration panel should now be available at http://localhost:4000/admin.
 
 - `yarn watch` starts yarn watch in all packages.
 - `yarn build` builds the `strapi-helper-plugin` (use this command when you develop in the administration panel).
+- `yarn commit` runs an interactive commit CLI to help you write a good commit message inline with our git conventions.
 - `yarn setup` installs dependencies.
 - `yarn lint` lints the codebase.
 - `yarn test:clean` removes the coverage reports.
@@ -118,6 +135,7 @@ The administration panel should now be available at http://localhost:4000/admin.
 - `yarn test:unit` runs the back-end unit tests.
 - `yarn test:api` runs the api integration tests.
 - `yarn test:generate-app` generates a test application.
+- `yarn test:run-app` runs a test application.
 - `yarn test:start-app` starts the test application.
 
 ---
@@ -127,9 +145,9 @@ The administration panel should now be available at http://localhost:4000/admin.
 The API integration tests require a Strapi app to be able to run. You can generate a "test app" using `yarn test:generate-app <database>`:
 
 ```bash
-$ yarn test:generate-app sqlite
-$ yarn test:generate-app postgres
-$ yarn test:generate-app mysql
+$ yarn test:generate-app --db=sqlite
+$ yarn test:generate-app --db=postgres
+$ yarn test:generate-app --db=mysql
 ```
 
 A new app is required every time you run the API integration tests, otherwise the test suite will fail. A command is available to make this process easier: `yarn test:api`.
@@ -138,7 +156,7 @@ This command runs tests using jest behind the scenes. Options for jest can be pa
 
 ### Changing the database
 
-By default the script run by `test:api` an app that uses `sqlite` as a database. But you can run the test suites using different databases:
+By default the script run by `test:api` generates an app that uses `sqlite` as a database. But you can run the test suites using different databases:
 
 ```bash
 $ yarn test:api --db=sqlite
@@ -157,13 +175,58 @@ $ STRAPI_LICENSE=<license> yarn test:api
 
 ---
 
+## Git Conventions
+
+### Commit messages
+
+We use the following convention:
+
+```
+type: subject
+
+body
+```
+
+The goal of this convention is to help us generate changelogs that can be communicated to our users.
+
+#### Type
+
+The types are based on our GitHub label, here are a subset:
+
+- `fix` – When fixing an issue.
+- `chore` – When doing some cleanup, working on tooling, some refactoring. (usually reserved for **internal** work)
+- `docs` – When writing documentation.
+- `feat` – When working on a feature.
+
+You can see the complete list [here](https://github.com/strapi/strapi/blob/develop/.commitlintrc.ts#L11).
+
+#### Subject
+
+The subject of a commit should be a summary of what the commit is about. It should not describe what the code is doing:
+
+- `feat: what the feature is`
+- `fix: what the problem is`
+- `chore: what the PR is about`
+- `docs: what is documented`
+
+Examples:
+
+- `feat: introduce document service`
+- `fix: unable to publish documents due to missing permissions`
+- `chore: refactor data-fetching in EditView to use react-query`
+- `docs: document service API reference`
+
+> ⚠️ For a `fix` commit the message should explain what the commit is fixing. Not what the solution is.
+
+---
+
 ## Miscellaneous
 
 ### Repository Organization
 
 We chose to use a monorepo design using [Yarn Workspaces](https://yarnpkg.com/en/docs/workspaces) in the way [React](https://github.com/facebook/react/tree/master/packages) or [Babel](https://github.com/babel/babel/tree/master/packages) does. This allows us to maintain the whole ecosystem keep it up-to-date and consistent.
 
-We do our best to keep the master branch as clean as possible, with tests passing at all times. However, the master branch can move faster than the release cycle. Therefore check the [releases on npm](https://www.npmjs.com/package/@strapi/strapi) so that you are always up-to-date with the latest stable version.
+We do our best to keep the develop branch as clean as possible, with tests passing at all times. However, the develop branch can move faster than the release cycle. Therefore check the [releases on npm](https://www.npmjs.com/package/@strapi/strapi) so that you are always up-to-date with the latest stable version.
 
 ### Reporting an issue
 
@@ -171,7 +234,7 @@ Before submitting an issue you need to make sure:
 
 - You are experiencing a technical issue with Strapi.
 - You have already searched for related [issues](https://github.com/strapi/strapi/issues) and found none open (if you found a related _closed_ issue, please link to it from your post).
-- You are not asking a question about how to use Strapi or about whether or not Strapi has a certain feature. For general help using Strapi, you may:
+- You are not asking a question about how to use Strapi or about whether Strapi has a certain feature. For general help using Strapi, you may:
   - Refer to the [official Strapi documentation](https://docs.strapi.io).
   - Ask a member of the community in the [Strapi Discord Community](https://discord.strapi.io/).
   - Ask a question on the [Strapi community forum](https://forum.strapi.io).

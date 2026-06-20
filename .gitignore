@@ -10,13 +10,11 @@ Icon
 .Trashes
 ._*
 
-
 ############################
 # Linux
 ############################
 
 *~
-
 
 ############################
 # Windows
@@ -30,7 +28,6 @@ $RECYCLE.BIN/
 *.msi
 *.msm
 *.msp
-
 
 ############################
 # Packages
@@ -60,7 +57,6 @@ $RECYCLE.BIN/
 *.out
 *.pid
 
-
 ############################
 # Logs and databases
 ############################
@@ -71,7 +67,6 @@ $RECYCLE.BIN/
 !.github/workflows/db/**/*.sql
 *.sqlite
 
-
 ############################
 # Misc.
 ############################
@@ -80,7 +75,6 @@ $RECYCLE.BIN/
 .idea
 nbproject
 .eslintcache
-
 
 ############################
 # Node.js
@@ -99,22 +93,12 @@ package-lock.json
 !docs/package-lock.json
 *.heapsnapshot
 
-
 ############################
 # Tests
 ############################
 
-testApp
+test-apps
 coverage
-cypress/screenshots
-cypress/videos
-
-
-############################
-# Documentation
-############################
-
-dist
 
 ############################
 # Builds
@@ -122,6 +106,10 @@ dist
 
 packages/generators/app/files/public/
 schema.graphql
+dist
+.nx
+.tsbuildinfo
+.eslintcache
 
 ############################
 # Example app
@@ -135,13 +123,13 @@ schema.graphql
 ############################
 
 .vscode/
-!.vscode/settings.json
 front-workspace.code-workspace
 .yarnrc
 
 ############################
-# Yarn
+# Package managers
 ############################
+
 .pnp.*
 .yarn/*
 !.yarn/patches
@@ -149,3 +137,43 @@ front-workspace.code-workspace
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+yarn-error.log
+pnpm-debug.log
+npm-debug.log
+
+############################
+# Playwright
+############################
+playwright-report
+tests/e2e/playwright-storage-state.json
+test-results
+tests/e2e/.env
+!tests/cli/data/*.tar.gz
+tests/cli/.env
+
+############################
+# AI tools
+############################
+.brain
+.brain.*
+
+# Claude
+CLAUDE.local.md
+.claude/
+
+# Cursor
+.cursor/
+!.cursor/worktrees.json
+
+# Codex
+.agents/
+
+############################
+# Strapi
+############################
+examples/**/types/generated
+.nx/cache
+.nx/workspace-data
+
+# Ignore yarn.lock inside templates
+templates/yarn.lock

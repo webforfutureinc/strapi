@@ -1,6 +1,6 @@
 {
   "name": "@strapi/provider-upload-aws-s3",
-  "version": "4.10.7",
+  "version": "5.48.0",
   "description": "AWS S3 provider for strapi upload",
   "keywords": [
     "upload",
@@ -14,7 +14,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/strapi/strapi.git"
+    "url": "https://github.com/strapi/strapi.git",
+    "directory": "packages/providers/upload-aws-s3"
   },
   "license": "SEE LICENSE IN LICENSE",
   "author": {
@@ -30,31 +31,36 @@
     }
   ],
   "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "source": "./src/index.ts",
   "types": "./dist/index.d.ts",
   "files": [
-    "./dist"
+    "dist/"
   ],
   "scripts": {
-    "build": "run -T tsc",
-    "build:ts": "run -T tsc",
-    "watch": "run -T tsc -w --preserveWatchOutput",
+    "build": "run -T npm-run-all clean --parallel build:code build:types",
+    "build:code": "run -T  rollup -c",
+    "build:types": "run -T tsc -p tsconfig.build.json --emitDeclarationOnly",
     "clean": "run -T rimraf ./dist",
-    "prepublishOnly": "yarn clean && yarn build",
+    "lint": "run -T eslint .",
     "test:unit": "run -T jest",
     "test:unit:watch": "run -T jest --watch",
-    "lint": "run -T eslint ."
+    "watch": "run -T rollup -c -w"
   },
   "dependencies": {
-    "aws-sdk": "2.1372.0",
-    "lodash": "4.17.21"
+    "@aws-sdk/client-s3": "3.1023.0",
+    "@aws-sdk/lib-storage": "3.1023.0",
+    "@aws-sdk/s3-request-presigner": "3.1023.0",
+    "@aws-sdk/types": "3.973.6",
+    "lodash": "4.18.1"
   },
   "devDependencies": {
-    "@types/jest": "29.2.0",
-    "eslint-config-custom": "4.10.7",
-    "tsconfig": "4.10.7"
+    "@types/jest": "29.5.2",
+    "eslint-config-custom": "5.48.0",
+    "tsconfig": "5.48.0"
   },
   "engines": {
-    "node": ">=14.19.1 <=18.x.x",
+    "node": ">=20.0.0 <=26.x.x",
     "npm": ">=6.0.0"
   }
 }
