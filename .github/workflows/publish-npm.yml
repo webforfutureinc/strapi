@@ -33,7 +33,7 @@ jobs:
     environment: production
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: ${{ (inputs.tag == 'experimental') && 1 || 0 }}
