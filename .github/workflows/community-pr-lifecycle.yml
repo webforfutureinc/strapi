@@ -48,7 +48,7 @@ jobs:
           echo "Running from base branch; PR head code is never executed."
 
       - name: Checkout base branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
 
       - name: Load Linear config
         run: grep -v '^#' .github/scripts/.env | grep -v '^$' >> "$GITHUB_ENV"
@@ -80,7 +80,7 @@ jobs:
 
     steps:
       - name: Checkout base branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
 
       - name: Load Linear config
         run: grep -v '^#' .github/scripts/.env | grep -v '^$' >> "$GITHUB_ENV"
