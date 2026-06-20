@@ -31,7 +31,7 @@ jobs:
       - name: Monorepo install
         uses: ./.github/actions/yarn-nm-install
 
-      - uses: preactjs/compressed-size-action@v2
+      - uses: preactjs/compressed-size-action@v3
         with:
           pattern: '**/build/**/*.{js,css,html,svg}'
           strip-hash: "\\.(?:(\\w{8})\\.chunk)|(?:\\.(\\w{8}))"
