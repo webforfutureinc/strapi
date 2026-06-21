@@ -72,7 +72,7 @@
     "esbuild-register": "3.6.0",
     "execa": "5.1.1",
     "fast-glob": "3.3.2",
-    "fs-extra": "11.3.4",
+    "fs-extra": "11.3.5",
     "jscodeshift": "17.3.0",
     "lodash": "4.18.1",
     "memfs": "4.6.0",
